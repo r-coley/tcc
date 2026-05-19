@@ -1,0 +1,27 @@
+.text
+.align 2
+.global _main
+_main:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    sub sp, sp, #16
+    movz x0, #42
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    str w0, [x29, #-4]
+    b skip
+    movz x0, #99
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    str w0, [x29, #-4]
+skip:
+    ldrsw x0, [x29, #-4]
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    mov sp, x29
+    ldp x29, x30, [sp], #16
+    ret
+    movz x0, #0
+    mov sp, x29
+    ldp x29, x30, [sp], #16
+    ret

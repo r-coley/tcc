@@ -1,0 +1,553 @@
+#include <stdio.h>
+
+#include "tcc.h"
+#include "target.h"
+#include "codegen.h"
+
+static void x64_preamble(void) {
+    printf(".intel_syntax noprefix\n");
+    printf(".text\n");
+}
+
+static void x64_func_start(const char *name, int is_static) {
+    if (!is_static)
+        printf(".global %s%s\n", TCC_ASM_SYM_PREFIX, name);
+    printf("%s%s:\n", TCC_ASM_SYM_PREFIX, name);
+    printf("    push rbp\n");
+    printf("    mov rbp, rsp\n");
+}
+
+static void x64_func_end(void) {
+    printf("    mov rsp, rbp\n");
+    printf("    pop rbp\n");
+    printf("    ret\n");
+}
+
+static void x64_stack_alloc(int size) {
+    if (size > 0)
+        printf("    sub rsp, %d\n", size);
+}
+
+static void x64_load_imm(int value) {
+    printf("    mov rax, %d\n", value);
+}
+
+static void x64_push_acc(void) {
+    printf("    sub rsp, 8\n");
+    printf("    mov [rsp], rax\n");
+}
+
+static void x64_pop_to_tmp(void) {
+    printf("    mov r10, [rsp]\n");
+    printf("    add rsp, 8\n");
+}
+
+static void x64_pop_to_acc(void) {
+    printf("    mov rax, [rsp]\n");
+    printf("    add rsp, 8\n");
+}
+
+static void x64_acc_to_arg(int index) {
+    static const char *regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+    if (index >= 0 && index < 6)
+        printf("    mov %s, rax\n", regs[index]);
+}
+
+static void x64_acc_to_tmp(void) {
+    printf("    mov r10, rax\n");
+}
+
+static void x64_tmp_to_acc(void) {
+    printf("    mov rax, r10\n");
+}
+
+static void x64_acc_to_saved(void) {
+    printf("    mov r11, rax\n");
+}
+
+static void x64_saved_to_acc(void) {
+    printf("    mov rax, r11\n");
+}
+
+static void x64_load_via_saved(int size) {
+    if (size == 1)
+        printf("    movsx rax, byte [r11]\n");
+    else if (size == 4)
+        printf("    mov eax, [r11]\n");
+    else
+        printf("    mov rax, [r11]\n");
+}
+
+static void x64_store_via_saved(int size) {
+    if (size == 1)
+        printf("    mov [r11], al\n");
+    else if (size == 4)
+        printf("    mov [r11], eax\n");
+    else
+        printf("    mov [r11], rax\n");
+}
+
+static void x64_add(void) {
+    printf("    add rax, r10\n");
+}
+
+static void x64_sub(void) {
+    printf("    sub r10, rax\n");
+    printf("    mov rax, r10\n");
+}
+
+static void x64_negate(void) {
+    printf("    neg rax\n");
+}
+
+static void x64_mul(void) {
+    printf("    imul rax, r10\n");
+}
+
+static void x64_div_op(void) {
+    printf("    mov r11, rax\n");
+    printf("    mov rax, r10\n");
+    printf("    cqo\n");
+    printf("    idiv r11\n");
+}
+
+static void x64_mod_op(void) {
+    printf("    mov r11, rax\n");
+    printf("    mov rax, r10\n");
+    printf("    cqo\n");
+    printf("    idiv r11\n");
+    printf("    mov rax, rdx\n");
+}
+
+
+static void x64_bitand_op(void) {
+    printf("    and rax, r10\n");
+}
+
+static void x64_bitor_op(void) {
+    printf("    or rax, r10\n");
+}
+
+static void x64_bitnot_op(void) {
+    printf("    not eax\n");
+}
+
+static void x64_bitxor_op(void) {
+    printf("    xor rax, r10\n");
+}
+
+static void x64_shl_op(void) {
+    printf("    mov rcx, rax\n");
+    printf("    mov rax, r10\n");
+    printf("    shl rax, cl\n");
+}
+
+static void x64_shr_op(void) {
+    printf("    mov rcx, rax\n");
+    printf("    mov rax, r10\n");
+    printf("    sar rax, cl\n");
+}
+
+static void x64_cast_op(int size) {
+    if (size == 1)
+        printf("    and rax, 255\n");
+}
+
+static void x64_ptr_add(int scale) {
+    if (scale == 4)
+        printf("    shl rax, 2\n");
+    else if (scale != 1)
+        printf("    imul rax, rax, %d\n", scale);
+    printf("    add rax, r10\n");
+}
+
+static void x64_ptr_sub(int scale) {
+    if (scale == 4)
+        printf("    shl rax, 2\n");
+    else if (scale != 1)
+        printf("    imul rax, rax, %d\n", scale);
+    printf("    sub r10, rax\n");
+    printf("    mov rax, r10\n");
+}
+
+static void x64_cmp_common(const char *op) {
+    printf("    cmp r10, rax\n");
+    printf("    %s al\n", op);
+    printf("    movzx rax, al\n");
+}
+
+static void x64_cmp_eq(void) { x64_cmp_common("sete"); }
+static void x64_cmp_ne(void) { x64_cmp_common("setne"); }
+static void x64_cmp_lt(void) { x64_cmp_common("setl"); }
+static void x64_cmp_le(void) { x64_cmp_common("setle"); }
+static void x64_cmp_gt(void) { x64_cmp_common("setg"); }
+static void x64_cmp_ge(void) { x64_cmp_common("setge"); }
+
+static void x64_cmp_lt_u(void) { x64_cmp_common("setb"); }
+static void x64_cmp_le_u(void) { x64_cmp_common("setbe"); }
+static void x64_cmp_gt_u(void) { x64_cmp_common("seta"); }
+static void x64_cmp_ge_u(void) { x64_cmp_common("setae"); }
+
+
+static const char *x64_slot(int offset) {
+    static char buf[32];
+    if (offset < 0)
+        snprintf(buf, sizeof(buf), "[rbp-%d]", -offset);
+    else
+        snprintf(buf, sizeof(buf), "[rbp+%d]", offset);
+    return buf;
+}
+
+static void x64_load_local(int offset) {
+    printf("    mov eax, DWORD PTR %s\n", x64_slot(offset));
+}
+
+static void x64_store_local(int offset) {
+    printf("    mov DWORD PTR %s, eax\n", x64_slot(offset));
+}
+
+static void x64_load_local_sized(int offset, int size) {
+    if (size == 1)
+        printf("    movzx eax, BYTE PTR %s\n", x64_slot(offset));
+    else if (size == 8)
+        printf("    mov rax, QWORD PTR %s\n", x64_slot(offset));
+    else
+        printf("    mov eax, DWORD PTR %s\n", x64_slot(offset));
+}
+
+static void x64_store_local_sized(int offset, int size) {
+    if (size == 1)
+        printf("    mov BYTE PTR %s, al\n", x64_slot(offset));
+    else if (size == 8)
+        printf("    mov QWORD PTR %s, rax\n", x64_slot(offset));
+    else
+        printf("    mov DWORD PTR %s, eax\n", x64_slot(offset));
+}
+
+static void x64_load_global(const char *name, int size) {
+    if (size == 1)
+        printf("    movzx eax, BYTE PTR [rip + \"%s%s\"]\n", TCC_ASM_SYM_PREFIX, name);
+    else if (size == 2)
+        printf("    movzx eax, WORD PTR [rip + \"%s%s\"]\n", TCC_ASM_SYM_PREFIX, name);
+    else if (size == 8)
+        printf("    mov rax, QWORD PTR [rip + \"%s%s\"]\n", TCC_ASM_SYM_PREFIX, name);
+    else
+        printf("    mov eax, DWORD PTR [rip + \"%s%s\"]\n", TCC_ASM_SYM_PREFIX, name);
+}
+
+static void x64_store_global(const char *name, int size) {
+    if (size == 1)
+        printf("    mov BYTE PTR [rip + \"%s%s\"], al\n", TCC_ASM_SYM_PREFIX, name);
+    else if (size == 2)
+        printf("    mov WORD PTR [rip + \"%s%s\"], ax\n", TCC_ASM_SYM_PREFIX, name);
+    else if (size == 8)
+        printf("    mov QWORD PTR [rip + \"%s%s\"], rax\n", TCC_ASM_SYM_PREFIX, name);
+    else
+        printf("    mov DWORD PTR [rip + \"%s%s\"], eax\n", TCC_ASM_SYM_PREFIX, name);
+}
+
+static void x64_load_global_indexed(const char *name, int elem_size) {
+    printf("    movsxd rax, eax\n");
+    if (elem_size == 4)
+        printf("    shl rax, 2\n");
+    else if (elem_size != 1)
+        printf("    imul rax, rax, %d\n", elem_size);
+    printf("    lea r11, [rip + \"%s%s\"]\n", TCC_ASM_SYM_PREFIX, name);
+    if (elem_size == 1)
+        printf("    movzx eax, BYTE PTR [r11 + rax]\n");
+    else
+        printf("    mov eax, DWORD PTR [r11 + rax]\n");
+}
+
+static void x64_store_global_indexed(const char *name, int elem_size) {
+    printf("    movsxd r10, r10d\n");
+    if (elem_size == 4)
+        printf("    shl r10, 2\n");
+    else if (elem_size != 1)
+        printf("    imul r10, r10, %d\n", elem_size);
+    printf("    lea r11, [rip + \"%s%s\"]\n", TCC_ASM_SYM_PREFIX, name);
+    if (elem_size == 1)
+        printf("    mov BYTE PTR [r11 + r10], al\n");
+    else
+        printf("    mov DWORD PTR [r11 + r10], eax\n");
+}
+
+static void x64_store_param(int index, int offset) {
+    static const char *regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+    if (index < 0 || index >= 6) {
+        ICE("x64 backend supports only 6 integer/pointer parameters");
+        return;
+    }
+
+    printf("    mov QWORD PTR %s, %s\n", x64_slot(offset), regs[index]);
+}
+
+static void x64_copy_local(int dst_offset, int src_offset, int size) {
+    for (int off = 0; off < size; off += 4) {
+        printf("    mov eax, DWORD PTR %s\n", x64_slot(src_offset + off));
+        printf("    mov DWORD PTR %s, eax\n", x64_slot(dst_offset + off));
+    }
+
+}
+
+static void x64_ptr_copy(int size) { (void)size; }
+
+static void x64_copy_local_to_ptr(int ptr_offset, int src_offset, int size) {
+    printf("    mov r11, QWORD PTR %s\n", x64_slot(ptr_offset));
+    for (int off = 0; off < size; off += 4) {
+        printf("    mov eax, DWORD PTR %s\n", x64_slot(src_offset + off));
+        printf("    mov DWORD PTR [r11+%d], eax\n", off);
+    }
+}
+
+static void x64_load_indexed(int base_offset, int elem_size) {
+    printf("    movsxd r10, eax\n");
+    if (elem_size == 4)
+        printf("    shl r10, 2\n");
+    else if (elem_size != 1)
+        printf("    imul r10, r10, %d\n", elem_size);
+    if (elem_size == 1)
+        printf("    movzx eax, BYTE PTR [rbp%+d+r10]\n", base_offset);
+    else
+        printf("    mov eax, DWORD PTR [rbp%+d+r10]\n", base_offset);
+}
+
+static void x64_store_indexed(int base_offset, int elem_size) {
+    printf("    movsxd r10, r10d\n");
+    if (elem_size == 4)
+        printf("    shl r10, 2\n");
+    else if (elem_size != 1)
+        printf("    imul r10, r10, %d\n", elem_size);
+    if (elem_size == 1)
+        printf("    mov BYTE PTR [rbp%+d+r10], al\n", base_offset);
+    else
+        printf("    mov DWORD PTR [rbp%+d+r10], eax\n", base_offset);
+}
+
+static void x64_addr_local(int offset) {
+    printf("    lea rax, [rbp%+d]\n", offset);
+}
+
+static void x64_addr_indexed(int base_offset, int elem_size) {
+    printf("    movsxd r10, eax\n");
+    if (elem_size == 4)
+        printf("    shl r10, 2\n");
+    else if (elem_size != 1)
+        printf("    imul r10, r10, %d\n", elem_size);
+    printf("    lea rax, [rbp%+d+r10]\n", base_offset);
+}
+
+static void x64_add_offset(int offset) {
+    if (offset)
+        printf("    add rax, %d\n", offset);
+}
+
+static void x64_load_ptr_local(int offset) {
+    printf("    mov rax, QWORD PTR %s\n", x64_slot(offset));
+}
+
+static void x64_store_ptr_local(int offset) {
+    printf("    mov QWORD PTR %s, rax\n", x64_slot(offset));
+}
+
+static void x64_load_deref(int size) {
+    if (size == 1)
+        printf("    movzx eax, BYTE PTR [rax]\n");
+    else
+        printf("    mov eax, DWORD PTR [rax]\n");
+}
+
+static void x64_store_deref(int size) {
+    if (size == 1)
+        printf("    mov BYTE PTR [r10], al\n");
+    else
+        printf("    mov DWORD PTR [r10], eax\n");
+}
+
+static void x64_load_member_ptr(int offset, int size) {
+    (void)size;
+    printf("    mov eax, DWORD PTR [rax+%d]\n", offset);
+}
+
+static void x64_store_member_ptr(int offset, int size) {
+    (void)size;
+    printf("    mov DWORD PTR [r10+%d], eax\n", offset);
+}
+
+static void x64_string_literal(int label, const char *value) {
+    printf("%s\n", TCC_ASM_CSTRING_SECTION);
+    printf("Lstr%d:\n", label);
+    printf("    .asciz \"");
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if (*p == '\\' || *p == '"')
+            printf("\\%c", *p);
+        else if (*p == '\n')
+            printf("\\n");
+        else if (*p == '\t')
+            printf("\\t");
+        else
+            printf("%c", *p);
+    }
+    printf("\"\n");
+    printf(".text\n");
+}
+
+static void x64_load_string(int label) {
+    printf("    lea rax, [rip + Lstr%d]\n", label);
+}
+
+
+static void x64_load_func_addr(const char *name) {
+    printf("    lea rax, [rip + \"%s%s\"]\n", TCC_ASM_SYM_PREFIX, name);
+}
+
+static void x64_inline_asm(const char *text) {
+    if (!text || !*text)
+        return;
+
+    printf("    %s\n", text);
+}
+
+static void x64_branch_if_zero(int label) {
+    printf("    cmp eax, 0\n");
+    printf("    je L%d\n", label);
+}
+
+static void x64_branch_if_nonzero(int label) {
+    printf("    cmp eax, 0\n");
+    printf("    jne L%d\n", label);
+}
+
+static void x64_branch(int label) {
+    printf("    jmp L%d\n", label);
+}
+
+static void x64_label(int label) {
+    printf("L%d:\n", label);
+}
+
+static void x64_emit_label_named_impl(const char *name) {
+    printf(".L%s:\n", name);
+}
+
+static void x64_emit_branch_named_impl(const char *name) {
+    printf("    jmp .L%s\n", name);
+}
+
+
+static void x64_prepare_call_args(int count, int fixed_params) {
+    (void)fixed_params;
+    static const char *regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+    if (count > 6) {
+        ICE("x64 backend supports only 6 integer/pointer parameters");
+        return;
+    }
+
+    for (int i = 0; i < count; i++) {
+        printf("    mov %s, QWORD PTR [rsp]\n", regs[i]);
+        printf("    add rsp, 8\n");
+    }
+}
+
+static void x64_call(const char *name) {
+    printf("    call %s%s\n", TCC_ASM_SYM_PREFIX, name);
+}
+
+static void x64_call_saved(void) {
+    printf("    call r11\n");
+}
+
+static void x64_cleanup_call_args(int count, int fixed_params) {
+    (void)fixed_params;
+    (void)count;
+}
+
+static void x64_load_global_extern(const char *name) {
+    x64_load_global(name, 8);  /* extern refs are always pointer-sized */
+}
+static void x64_store_global_extern(const char *name) {
+    x64_store_global(name, 8);
+}
+
+Codegen x64_codegen = {
+    x64_preamble,
+    x64_func_start,
+    x64_func_end,
+    x64_stack_alloc,
+    x64_load_imm,
+    x64_push_acc,
+    x64_pop_to_tmp,
+    x64_pop_to_acc,
+    x64_acc_to_arg,
+    x64_acc_to_tmp,
+    x64_tmp_to_acc,
+    x64_acc_to_saved,
+    x64_saved_to_acc,
+    x64_load_via_saved,
+    x64_store_via_saved,
+    x64_add,
+    x64_sub,
+    x64_negate,
+    x64_mul,
+    x64_div_op,
+    x64_mod_op,
+    x64_bitand_op,
+    x64_bitor_op,
+    x64_bitnot_op,
+    x64_bitxor_op,
+    x64_shl_op,
+    x64_shr_op,
+    x64_cast_op,
+    x64_ptr_add,
+    x64_ptr_sub,
+    x64_cmp_eq,
+    x64_cmp_ne,
+    x64_cmp_lt,
+    x64_cmp_le,
+    x64_cmp_gt,
+    x64_cmp_ge,
+    x64_load_local,
+    x64_store_local,
+    x64_load_local_sized,
+    x64_store_local_sized,
+    x64_load_global,
+    x64_load_global_extern,   /* load_global_extern: no GOT needed */
+    x64_store_global,
+    x64_store_global_extern,  /* store_global_extern: no GOT needed */
+    x64_load_global_indexed,
+    x64_store_global_indexed,
+    x64_store_param,
+    x64_copy_local,
+    x64_ptr_copy,
+    x64_copy_local_to_ptr,
+    x64_load_indexed,
+    x64_store_indexed,
+    x64_addr_local,
+    x64_addr_indexed,
+    x64_add_offset,
+    x64_load_ptr_local,
+    x64_store_ptr_local,
+    x64_load_deref,
+    x64_store_deref,
+    x64_load_member_ptr,
+    x64_store_member_ptr,
+    x64_string_literal,
+    x64_load_string,
+    x64_load_func_addr,
+    x64_inline_asm,
+    x64_branch_if_zero,
+    x64_branch_if_nonzero,
+    x64_branch,
+    x64_label,
+    x64_prepare_call_args,
+    x64_call,
+    x64_call_saved,
+    x64_cleanup_call_args,
+    x64_emit_label_named_impl,
+    x64_emit_branch_named_impl,
+    NULL,               /* emit_source_loc: not implemented for x64 */
+    x64_cmp_lt_u,
+    x64_cmp_le_u,
+    x64_cmp_gt_u,
+    x64_cmp_ge_u
+};

@@ -1,0 +1,44 @@
+--- cc/ir.c	2026-05-18 18:15:53.000000000 +0000
++++ cc/ir.c	2026-05-19 14:39:44.479108570 +0000
+@@ -97,8 +97,19 @@
+ 				ir_emit_sym(globals[i].name, globals[i].is_static);
+ 				if (globals[i].init_count > 0) {
+ 					int total = globals[i].array_len * globals[i].elem_size;
+-					for (int j = 0; j < total; j++)
+-						printf("    .byte %d\n", globals[i].init_values[j] & 255);
++					int j = 0;
++					while (j < total) {
++						int slot = j / 8;
++						if ((j % 8) == 0 && slot < 128 &&
++						    globals[i].init_syms[slot][0] != '\0' &&
++						    j + 8 <= total) {
++							printf("    .quad _%s\n", globals[i].init_syms[slot]);
++							j += 8;
++						} else {
++							printf("    .byte %d\n", globals[i].init_values[j] & 255);
++							j++;
++						}
++					}
+ 				} else {
+ 					printf("    .zero %d\n", globals[i].array_len * globals[i].elem_size);
+ 				}
+@@ -113,7 +124,18 @@
+ 				ir_emit_sym(globals[i].name, globals[i].is_static);
+ 				for (int j = 0; j < globals[i].array_len; j++) {
+ 					int value = j < globals[i].init_count ? globals[i].init_values[j] : 0;
+-					printf("    .word %d\n", value);
++					if (j < 128 && globals[i].init_syms[j][0] != '\0') {
++						if (globals[i].elem_size == 8)
++							printf("    .quad _%s\n", globals[i].init_syms[j]);
++						else
++							printf("    .word _%s\n", globals[i].init_syms[j]);
++					} else if (globals[i].elem_size == 8) {
++						printf("    .quad %d\n", value);
++					} else if (globals[i].elem_size == 2) {
++						printf("    .short %d\n", value & 65535);
++					} else {
++						printf("    .word %d\n", value);
++					}
+ 				}
+ 			} else {
+ 				printf("    .align 4\n");

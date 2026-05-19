@@ -1,0 +1,63 @@
+--- cc/parser.c	2026-05-19 14:05:50.000000000 +0000
++++ cc/parser.c	2026-05-19 14:39:44.478149061 +0000
+@@ -718,6 +718,7 @@
+ static Node *parse_arg_list(void);
+ static Node *make_scalar_var_node(const char *name);
+ static Node *build_local_zero_fill_block(const char *name, int offset, int bytes, Node *decl);
++static Node *append_local_zero_fill(Node *head, const char *name, int offset, int bytes);
+ static Node *make_incdec(Node *node, TokenKind op, int is_postfix);
+ static Type *parse_type_name(void);
+ static Type *parse_enum_specifier(void);
+@@ -1559,6 +1560,13 @@
+ 
+ 		int elem_offset = base_offset + index * def->size;
+ 
++		/* Automatic aggregate initialization starts from an all-zero object.
++		 * The per-field assignments below then overwrite the explicitly
++		 * initialized members.  This is required not only for omitted fields,
++		 * but also for padding bytes and array tails, which torture/00216
++		 * prints byte-for-byte. */
++		head = append_local_zero_fill(head, var_name, elem_offset, def->size);
++
+ 		if (lexer_peek()->kind == TOK_LBRACE) {
+ 			lexer_next();
+ 			head = parse_struct_initializer_values(def, struct_name,
+@@ -1801,7 +1809,8 @@
+ 	}
+ 
+ 	StructDef *def = find_struct(struct_name);
+-	Node *head = parse_struct_initializer_values(def, struct_name, base_offset, decl_node);
++	Node *head = append_local_zero_fill(decl_node, var_name, base_offset, def->size);
++	head = parse_struct_initializer_values(def, struct_name, base_offset, head);
+ 
+ 	Debug(1, "STRUCT_INIT_BLOCK_BEFORE_CLOSE name=%s struct=%s tok=%s text=%s next=%s next_text=%s\n",
+ 	      var_name ? var_name : "<anon>",
+@@ -6186,18 +6195,19 @@
+ }
+ 
+ static Node *
+-build_local_zero_fill_block(const char *name, int offset, int bytes, Node *decl)
++append_local_zero_fill(Node *head, const char *name, int offset, int bytes)
+ {
+-	Node head = {0};
+-	Node *cur = &head;
+-
+-	if (decl)
+-		append_stmt(&cur, decl);
+-
+ 	for (int i = 0; i < bytes; i++)
+-		append_stmt(&cur, make_local_array_store(name, offset, 1, i, 0));
++		head = append_node(head, make_local_array_store(name, offset, 1, i, 0));
++	return head;
++}
+ 
+-	return new_block(head.next);
++static Node *
++build_local_zero_fill_block(const char *name, int offset, int bytes, Node *decl)
++{
++	Node *head = decl;
++	head = append_local_zero_fill(head, name, offset, bytes);
++	return new_block(head);
+ }
+ 
+ static Node *

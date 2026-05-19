@@ -1,0 +1,6 @@
+
+int value() {
+    char *s;
+    s = "A";
+    return 10;
+}

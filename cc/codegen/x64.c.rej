@@ -1,0 +1,24 @@
+--- cc/codegen/x64.c	2026-05-16 21:10:32.000000000 +0000
++++ cc/codegen/x64.c	2026-05-19 14:40:38.825329797 +0000
+@@ -352,6 +352,10 @@
+ static void x64_load_deref(int size) {
+     if (size == 1)
+         printf("    movzx eax, BYTE PTR [rax]\n");
++    else if (size == 2)
++        printf("    movsx eax, WORD PTR [rax]\n");
++    else if (size == 8)
++        printf("    mov rax, QWORD PTR [rax]\n");
+     else
+         printf("    mov eax, DWORD PTR [rax]\n");
+ }
+@@ -359,6 +363,10 @@
+ static void x64_store_deref(int size) {
+     if (size == 1)
+         printf("    mov BYTE PTR [r10], al\n");
++    else if (size == 2)
++        printf("    mov WORD PTR [r10], ax\n");
++    else if (size == 8)
++        printf("    mov QWORD PTR [r10], rax\n");
+     else
+         printf("    mov DWORD PTR [r10], eax\n");
+ }

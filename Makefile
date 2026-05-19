@@ -25,7 +25,6 @@ SRCS = \
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
 TEST_MANIFEST = $(TEST_DIR)/manifest.txt
-#TESTS_ALL = $(shell sort $(TEST_MANIFEST))
 TESTS_ALL = $(shell egrep -v '^\#' $(TEST_MANIFEST) | sort)
 
 # Optional: filter to a single category. Use: make test CATEGORY=abi
@@ -133,7 +132,7 @@ test: $(TARGET) | $(TMP_DIR)
 			last=1; \
 		else \
 			[ $$last -eq 1 ] && echo; \
-			echo "FAIL $$base (expected=$$expected actual=$$actual)"; \
+			echo "FAIL $tt $$base (expected=$$expected actual=$$actual)"; \
 			fail=$$((fail + 1)); \
 			last=0; \
 		fi; \

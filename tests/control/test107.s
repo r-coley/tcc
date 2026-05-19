@@ -1,0 +1,85 @@
+.text
+.align 2
+.global _main
+_main:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    sub sp, sp, #16
+    movz x0, #0
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    str w0, [x29, #-4]
+    movz x0, #0
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    str w0, [x29, #-8]
+L1:
+    ldrsw x0, [x29, #-4]
+    str x0, [sp, #-16]!
+    movz x0, #1
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    ldr x1, [sp], #16
+    add x0, x1, x0
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    str w0, [x29, #-4]
+    ldrsw x0, [x29, #-4]
+    str x0, [sp, #-16]!
+    movz x0, #2
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    ldr x1, [sp], #16
+    cmp w1, w0
+    cset w0, eq
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    cmp w0, #0
+    b.eq L4
+    b L2
+    b L5
+L4:
+L5:
+    ldrsw x0, [x29, #-4]
+    str x0, [sp, #-16]!
+    movz x0, #5
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    ldr x1, [sp], #16
+    cmp w1, w0
+    cset w0, eq
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    cmp w0, #0
+    b.eq L6
+    b L3
+    b L7
+L6:
+L7:
+    ldrsw x0, [x29, #-8]
+    str x0, [sp, #-16]!
+    ldrsw x0, [x29, #-4]
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    ldr x1, [sp], #16
+    add x0, x1, x0
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    str w0, [x29, #-8]
+L2:
+    movz x0, #1
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    cmp w0, #0
+    b.ne L1
+L3:
+    ldrsw x0, [x29, #-8]
+    str x0, [sp, #-16]!
+    ldr x0, [sp], #16
+    mov sp, x29
+    ldp x29, x30, [sp], #16
+    ret
+    movz x0, #0
+    mov sp, x29
+    ldp x29, x30, [sp], #16
+    ret

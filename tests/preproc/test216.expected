@@ -1,0 +1,4 @@
+
+char *value() {
+    return "hello world";
+}
