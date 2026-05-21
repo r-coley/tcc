@@ -2032,6 +2032,51 @@ global_array_decay_type(const char *name, int *out_elem_size)
 	return type_ptr(elem);
 }
 
+static int
+global_array_stride_bytes_for_dim(Global *g, int dim)
+{
+	int stride = g && g->elem_size ? g->elem_size : 4;
+	if (!g)
+		return stride;
+	for (int i = dim + 1; i < g->array_dim_count && i < MAX_ARRAY_DIMS; i++) {
+		int d = g->array_dims[i] ? g->array_dims[i] : 1;
+		stride *= d;
+	}
+	return stride;
+}
+
+static Node *
+scale_index_to_bytes(Node *idx, int stride)
+{
+	if (stride == 1)
+		return idx;
+	return new_binary(ND_MUL, idx, new_num(stride));
+}
+
+static Node *
+append_byte_index(Node *acc, Node *idx, int stride)
+{
+	Node *term = scale_index_to_bytes(idx, stride);
+	if (!acc)
+		return term;
+	return new_binary(ND_ADD, acc, term);
+}
+
+static Type *
+global_array_remaining_ptr_type(Global *g, int consumed_dims, int *out_elem_size)
+{
+	Type *elem = type_for_size(g && g->elem_size ? g->elem_size : 4);
+	if (g && consumed_dims < g->array_dim_count) {
+		elem = build_array_type_from_dims(elem,
+		                                  g->array_dims + consumed_dims,
+		                                  g->array_dim_count - consumed_dims);
+	}
+	if (out_elem_size)
+		*out_elem_size = elem ? elem->size : (g && g->elem_size ? g->elem_size : 4);
+	return type_ptr(elem);
+}
+
+
 static int 
 is_global_unsigned(const char *name)
 {
@@ -2774,7 +2819,7 @@ add_static_local(const char *name, const char *global_name, Type *type, int elem
 static int 
 is_static_local(const char *name)
 {
-	for (int i = 0; i < local_count; i++)
+	for (int i = local_count - 1; i >= 0; i--)
 		if (STRCMP(locals[i].name, name) == 0 && locals[i].is_static)
 			return 1;
 	return 0;
@@ -2783,7 +2828,7 @@ is_static_local(const char *name)
 static const char *
 static_global_name_local(const char *name)
 {
-	for (int i = 0; i < local_count; i++)
+	for (int i = local_count - 1; i >= 0; i--)
 		if (STRCMP(locals[i].name, name) == 0 && locals[i].is_static)
 			return locals[i].static_global_name;
 	return "";
@@ -2792,7 +2837,7 @@ static_global_name_local(const char *name)
 static int 
 static_local_elem_size(const char *name)
 {
-	for (int i = 0; i < local_count; i++)
+	for (int i = local_count - 1; i >= 0; i--)
 		if (STRCMP(locals[i].name, name) == 0 && locals[i].is_static)
 			return locals[i].elem_size ? locals[i].elem_size : 4;
 	return 4;
@@ -2801,7 +2846,7 @@ static_local_elem_size(const char *name)
 static int 
 is_static_array_local(const char *name)
 {
-	for (int i = 0; i < local_count; i++)
+	for (int i = local_count - 1; i >= 0; i--)
 		if (STRCMP(locals[i].name, name) == 0 && locals[i].is_static)
 			return locals[i].is_array;
 	return 0;
@@ -2812,7 +2857,7 @@ add_char_local(const char *name)
 {
 	int offset = add_local_sized(name, 1, 0);
 
-	for (int i = 0; i < local_count; i++) {
+	for (int i = local_count - 1; i >= 0; i--) {
 		if (STRCMP(locals[i].name, name) == 0) {
 			locals[i].elem_size = 1;
 			locals[i].type = type_char();
@@ -2834,7 +2879,7 @@ add_array_local(const char *name, int len, int elem_size)
 	int slots = (bytes + 3) / 4;
 	int offset = add_local_sized(name, slots, 1);
 
-	for (int i = 0; i < local_count; i++) {
+	for (int i = local_count - 1; i >= 0; i--) {
 		if (STRCMP(locals[i].name, name) == 0) {
 			locals[i].array_len = len;
 			locals[i].elem_size = elem_size;
@@ -2851,7 +2896,9 @@ add_pointer_local(const char *name, int elem_size)
 {
 	int offset = add_local_sized(name, 2, 0);
 
-	for (int i = 0; i < local_count; i++) {
+	/* Search backward to find the most-recently added local (the one just added),
+	 * not an earlier same-named local from a sibling scope. */
+	for (int i = local_count - 1; i >= 0; i--) {
 		if (STRCMP(locals[i].name, name) == 0) {
 			locals[i].is_pointer = 1;
 			locals[i].elem_size = elem_size;
@@ -2876,7 +2923,8 @@ static int add_typed_local(const char *name, Type *type)
 		int elem_size = type->base ? type->base->size : 4;
 		int offset = add_pointer_local(name, elem_size);
 
-		for (int i = 0; i < local_count; i++) {
+		/* Search backward to find the most-recently added local. */
+		for (int i = local_count - 1; i >= 0; i--) {
 			if (STRCMP(locals[i].name, name) == 0) {
 				locals[i].type = clone_type(type);
 				locals[i].is_pointer = 1;
@@ -2896,7 +2944,8 @@ static int add_typed_local(const char *name, Type *type)
 		int slots = (bytes + 3) / 4;
 		int offset = add_local_sized(name, slots, 1);
 
-		for (int i = 0; i < local_count; i++) {
+		/* Search backward to find the most-recently added local. */
+		for (int i = local_count - 1; i >= 0; i--) {
 			if (STRCMP(locals[i].name, name) == 0) {
 				locals[i].type = clone_type(type);
 				locals[i].array_len = type->array_len;
@@ -2925,7 +2974,7 @@ add_typed_array_local(const char *name, Type *base_type, int len)
 	int elem_size = type_elem_size(base_type);
 	int offset = add_array_local(name, len, elem_size);
 
-	for (int i = 0; i < local_count; i++) {
+	for (int i = local_count - 1; i >= 0; i--) {
 		if (STRCMP(locals[i].name, name) == 0) {
 			locals[i].type = type_array(clone_type(base_type), len);
 			locals[i].elem_size = elem_size;
@@ -2939,7 +2988,7 @@ add_typed_array_local(const char *name, Type *base_type, int len)
 static int 
 is_pointer_local(const char *name)
 {
-	for (int i = 0; i < local_count; i++) {
+	for (int i = local_count - 1; i >= 0; i--) {
 		if (STRCMP(locals[i].name, name) == 0)
 			return locals[i].is_pointer;
 	}
@@ -2950,7 +2999,7 @@ is_pointer_local(const char *name)
 static int 
 is_pointer_local_optional(const char *name)
 {
-	for (int i = 0; i < local_count; i++) {
+	for (int i = local_count - 1; i >= 0; i--) {
 		if (STRCMP(locals[i].name, name) == 0)
 			return locals[i].is_pointer;
 	}
@@ -2971,7 +3020,7 @@ type_local(const char *name)
 static int 
 elem_size_local(const char *name)
 {
-	for (int i = 0; i < local_count; i++) {
+	for (int i = local_count - 1; i >= 0; i--) {
 		if (STRCMP(locals[i].name, name) == 0)
 			return locals[i].elem_size ? locals[i].elem_size : 4;
 	}
@@ -2982,7 +3031,7 @@ elem_size_local(const char *name)
 static int 
 is_array_local(const char *name)
 {
-	for (int i = 0; i < local_count; i++) {
+	for (int i = local_count - 1; i >= 0; i--) {
 		if (STRCMP(locals[i].name, name) == 0)
 			return locals[i].is_array;
 	}
@@ -3175,6 +3224,14 @@ parse_struct_body_into(StructDef *def)
 			Type *this_field_type = clone_type(field_type);
 			int this_field_size = field_size;
 
+			/* Collect all array dimensions first, then build type inside-out.
+			 * For "char name[128][64]": dims=[128,64], built as
+			 * type_array(type_array(char, 64), 128) = array[128] of array[64] of char.
+			 * Left-to-right application would swap dimensions. */
+			int field_dims[MAX_ARRAY_DIMS];
+			int field_dim_count = 0;
+			int flexible_field = 0;
+
 			while (lexer_peek()->kind == TOK_LBRACKET) {
 				lexer_next();
 
@@ -3191,8 +3248,7 @@ parse_struct_body_into(StructDef *def)
 						fatal_cur("Flexible array member not allowed in union\n");
 					}
 					flexible_array_member = 1;
-					this_field_type = type_array(this_field_type, 0);
-					this_field_size = 0;
+					flexible_field = 1;
 					lexer_next();
 					break;
 				}
@@ -3201,10 +3257,20 @@ parse_struct_body_into(StructDef *def)
 				if (len->kind != TOK_NUM || len->value < 0) {
 					fatal_cur("Expected numeric struct field array length\n");
 				}
-				this_field_type = type_array(this_field_type, len->value);
-				this_field_size = this_field_type->size;
+				if (field_dim_count < MAX_ARRAY_DIMS)
+					field_dims[field_dim_count++] = len->value;
 				lexer_next();
 				expect(TOK_RBRACKET);
+			}
+
+			if (flexible_field) {
+				this_field_type = type_array(this_field_type, 0);
+				this_field_size = 0;
+			} else if (field_dim_count > 0) {
+				/* Apply dimensions right-to-left (innermost first) */
+				for (int di = field_dim_count - 1; di >= 0; di--)
+					this_field_type = type_array(this_field_type, field_dims[di]);
+				this_field_size = this_field_type->size;
 			}
 			/* Bitfield: "type name : N" -- skip the bit width specifier */
 			if (lexer_peek()->kind == TOK_COLON) {
@@ -4009,6 +4075,16 @@ make_var_node(const char *name)
 
 	if (is_static_local(name)) {
 		const char *gname = static_global_name_local(name);
+		if (is_static_array_local(name)) {
+			/* Static local arrays are backed by globals, but in expressions they
+			 * still undergo array-to-pointer decay.  Use the symbol address rather
+			 * than loading the first element. */
+			Node *node = new_func_addr(gname);
+			node->is_pointer = 1;
+			node->elem_size = static_local_elem_size(name);
+			node->type = type_ptr(type_for_size(node->elem_size));
+			return node;
+		}
 		Node *node = new_global(gname);
 		node->elem_size = static_local_elem_size(name);
 		node->type = type_for_size(node->elem_size);
@@ -4136,6 +4212,16 @@ make_scalar_var_node(const char *name)
 
 	if (is_static_local(name)) {
 		const char *gname = static_global_name_local(name);
+		if (is_static_array_local(name)) {
+			/* Static local arrays are backed by globals, but in expressions they
+			 * still undergo array-to-pointer decay.  Use the symbol address rather
+			 * than loading the first element. */
+			Node *node = new_func_addr(gname);
+			node->is_pointer = 1;
+			node->elem_size = static_local_elem_size(name);
+			node->type = type_ptr(type_for_size(node->elem_size));
+			return node;
+		}
 		Node *node = new_global(gname);
 		node->elem_size = static_local_elem_size(name);
 		node->type = type_for_size(node->elem_size);
@@ -4407,6 +4493,8 @@ static Node *parse_generic_selection(void)
 			ctrl_is_long = (ctrl_size == 8 && !ctrl_is_ptr);
 		}
 	}
+	(void)ctrl_is_str;
+	(void)ctrl_is_unsigned;
 
 	Node *result = NULL;
 	Node *default_result = NULL;
@@ -4713,18 +4801,42 @@ parse_factor(void)
 			if (is_global_array(ident_name)) {
 				Global *gg = find_global(ident_name);
 				if (gg && gg->array_dim_count > 1) {
-					Node *base = new_func_addr(ident_name);
-					base->is_pointer = 1;
-					base->type = global_array_decay_type(ident_name, &base->elem_size);
-					Node *addr = new_binary(ND_ADD, base, index);
+					/*
+					 * Multi-dimensional global array indexing is lowered here using
+					 * the declaration's stored dimension table, not the TY_ARRAY chain.
+					 * This avoids the stage1 self-host bug where Type.size metadata in
+					 * the chained postfix path produced corrupt strides such as
+					 * 20 << 24 for arr[][3][5].  Build a byte offset directly:
+					 *
+					 *   arr[i][j][k] -> *(base + ((i*D1*D2 + j*D2 + k) * elem_size))
+					 */
+					int dim = 0;
+					Node *byte_index = append_byte_index(NULL, index,
+					                                     global_array_stride_bytes_for_dim(gg, dim));
+					dim++;
+
+					while (dim < gg->array_dim_count && lexer_peek()->kind == TOK_LBRACKET) {
+						lexer_next();
+						Node *next_index = parse_expr();
+						expect(TOK_RBRACKET);
+						byte_index = append_byte_index(byte_index, next_index,
+						                               global_array_stride_bytes_for_dim(gg, dim));
+						dim++;
+					}
+
+					Node *addr = new_global_index(ident_name, byte_index, 1);
+					addr->is_array_field = 1; /* byte index: produce address */
 					addr->is_pointer = 1;
-					addr->elem_size = base->elem_size;
-					addr->type = base->type;
-					Node *deref = new_deref(addr);
-					if (base->type && base->type->kind == TY_PTR)
-						deref->type = base->type->base;
-					deref->elem_size = deref->type ? deref->type->size : base->elem_size;
-					return deref;
+
+					if (dim >= gg->array_dim_count) {
+						Node *deref = new_deref(addr);
+						deref->elem_size = gg->elem_size ? gg->elem_size : 4;
+						deref->type = type_for_size(deref->elem_size);
+						return deref;
+					}
+
+					addr->type = global_array_remaining_ptr_type(gg, dim, &addr->elem_size);
+					return addr;
 				}
 				return new_global_index(ident_name, index, global_elem_size(ident_name));
 			}
@@ -5056,40 +5168,45 @@ parse_postfix(void)
 			expect(TOK_RBRACKET);
 
 			if (node->type && node->type->kind == TY_ARRAY && node->type->base) {
-				Type *elem_type = node->type->base;
+				/*
+				 * Keep this path deliberately simple for the self-hosted compiler:
+				 * older stage1 builds have miscompiled a local Type *elem_type in
+				 * this large function, corrupting elem_size and therefore array
+				 * indexing strides.  Use node->type->base directly instead.
+				 */
 				Node *base = new_addr(node);
 				base->is_pointer = 1;
-				base->elem_size = elem_type->size;
-				base->type = type_ptr(elem_type);
+				base->elem_size = node->type->base->size;
+				base->type = type_ptr(node->type->base);
 
 				Node *addr = new_binary(ND_ADD, base, index);
 				addr->is_pointer = 1;
-				addr->elem_size = elem_type->size;
-				addr->type = type_ptr(elem_type);
+				addr->elem_size = node->type->base->size;
+				addr->type = type_ptr(node->type->base);
 
 				node = new_deref(addr);
-				node->type = elem_type;
-				node->elem_size = elem_type->size;
-				if (elem_type->kind == TY_STRUCT)
-					STRNCPY(node->struct_name, elem_type->struct_name, sizeof(node->struct_name) - 1);
+				node->type = addr->type->base;
+				node->elem_size = node->type ? node->type->size : addr->elem_size;
+				if (node->type && node->type->kind == TY_STRUCT)
+					STRNCPY(node->struct_name, node->type->struct_name, sizeof(node->struct_name) - 1);
 				continue;
 			}
 
 			if ((node->type && node->type->kind == TY_PTR && node->type->base) || node->is_pointer) {
-				Type *elem_type = (node->type && node->type->kind == TY_PTR && node->type->base)
-				                  ? node->type->base
-				                  : type_for_size(node->elem_size ? node->elem_size : 4);
+				Type *ptr_base_type = (node->type && node->type->kind == TY_PTR && node->type->base)
+				                      ? node->type->base
+				                      : type_for_size(node->elem_size ? node->elem_size : 4);
 
 				Node *addr = new_binary(ND_ADD, node, index);
 				addr->is_pointer = 1;
-				addr->elem_size = elem_type->size;
-				addr->type = type_ptr(elem_type);
+				addr->elem_size = ptr_base_type->size;
+				addr->type = type_ptr(ptr_base_type);
 
 				node = new_deref(addr);
-				node->type = elem_type;
-				node->elem_size = elem_type->size;
-				if (elem_type->kind == TY_STRUCT)
-					STRNCPY(node->struct_name, elem_type->struct_name, sizeof(node->struct_name) - 1);
+				node->type = addr->type->base;
+				node->elem_size = node->type ? node->type->size : addr->elem_size;
+				if (node->type && node->type->kind == TY_STRUCT)
+					STRNCPY(node->struct_name, node->type->struct_name, sizeof(node->struct_name) - 1);
 				continue;
 			}
 
@@ -5276,6 +5393,7 @@ sizeof_node(Node *node)
 	if (!node)
 		return 4;
 
+
 	/*
 	 * Array subscripting nodes carry the actual element width in elem_size.
 	 * Do this before the generic type check: helper constructors for indexed
@@ -5288,8 +5406,13 @@ sizeof_node(Node *node)
 	 *
 	 * where table[0] must be 8 bytes on 64-bit targets, not 4.
 	 */
-	if (node->kind == ND_INDEX || node->kind == ND_GLOBAL_INDEX)
+	if (node->kind == ND_INDEX || node->kind == ND_GLOBAL_INDEX) {
+		/* If the indexed element is itself an array (e.g. arr[i].name where
+		 * name is char[64]), return the full array size, not the element size. */
+		if (node->type && node->type->kind == TY_ARRAY)
+			return node->type->size;
 		return node->elem_size ? node->elem_size : 4;
+	}
 
 	if (node->kind == ND_DEREF)
 		return node->elem_size ? node->elem_size : 4;
@@ -9809,7 +9932,13 @@ try_parse_global_addr_struct_compound_literal(Global **pg)
 	    lexer_peek_fifth()->kind != TOK_LBRACE)
 		return 0;
 
-	Global saved_ptr = *ptr_g;
+	/* Save just the fields we need from ptr_g before we reuse its slot. */
+	char saved_name[64] = {0};
+	char saved_struct_name[64] = {0};
+	int saved_elem_size = ptr_g->elem_size;
+	int saved_ptr_elem_size = ptr_g->ptr_elem_size;
+	STRNCPY(saved_name, ptr_g->name, sizeof(saved_name) - 1);
+	STRNCPY(saved_struct_name, ptr_g->struct_name, sizeof(saved_struct_name) - 1);
 
 	lexer_next(); /* & */
 	expect(TOK_LPAREN);
@@ -9850,9 +9979,13 @@ try_parse_global_addr_struct_compound_literal(Global **pg)
 		exit(1);
 	}
 
+	/* Set up the pointer global in the next free slot, restoring the saved fields. */
 	ptr_g = &globals[global_count];
 	memset(ptr_g, 0, sizeof(*ptr_g));
-	*ptr_g = saved_ptr;
+	STRNCPY(ptr_g->name, saved_name, sizeof(ptr_g->name) - 1);
+	STRNCPY(ptr_g->struct_name, saved_struct_name, sizeof(ptr_g->struct_name) - 1);
+	ptr_g->elem_size = saved_elem_size;
+	ptr_g->ptr_elem_size = saved_ptr_elem_size;
 	ptr_g->is_addr = 1;
 	STRNCPY(ptr_g->addr_name, lit_name, sizeof(ptr_g->addr_name) - 1);
 	*pg = ptr_g;
@@ -10984,6 +11117,7 @@ parse_program(const char *filename, const char *source)
 						known_total *= dims[d];
 					}
 				}
+				(void)known_total;
 
 				if (lexer_peek()->kind == TOK_ASSIGN) {
 					lexer_next();

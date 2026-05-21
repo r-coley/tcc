@@ -796,7 +796,7 @@ torture/00209.c:0
 torture/00210.c:0
 torture/00211.c:0
 torture/00212.c:0
-#torture/00213.c:0
+torture/00213.c:0
 torture/00214.c:0
 torture/00215.c:0
 torture/00216.c:0

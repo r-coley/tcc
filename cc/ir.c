@@ -1003,6 +1003,61 @@ tail:
 	}
 }
 
+
+static int
+ir_node_can_yield_expression_value(Node *node)
+{
+	if (!node)
+		return 0;
+
+	switch (node->kind) {
+	case ND_DECL:
+	case ND_ARRAY_DECL:
+	case ND_PTR_DECL:
+	case ND_STRUCT_DECL:
+	case ND_LABEL:
+	case ND_GOTO:
+	case ND_CASE:
+	case ND_DEFAULT:
+	case ND_BREAK:
+	case ND_CONTINUE:
+	case ND_RETURN:
+	case ND_IF:
+	case ND_WHILE:
+	case ND_FOR:
+	case ND_DO_WHILE:
+	case ND_SWITCH:
+	case ND_ASM:
+		return 0;
+	default:
+		return 1;
+	}
+}
+
+static void
+ir_block_expr(IRProgram *ir, Node *block)
+{
+	Node *last = NULL;
+
+	if (!block || !block->body) {
+		ir_emit(ir, IR_CONST, NULL, NULL, 0);
+		return;
+	}
+
+	for (Node *stmt = block->body; stmt; stmt = stmt->next)
+		last = stmt;
+
+	for (Node *stmt = block->body; stmt && stmt != last; stmt = stmt->next)
+		ir_stmt(ir, stmt);
+
+	if (ir_node_can_yield_expression_value(last)) {
+		ir_expr(ir, last);
+	} else {
+		ir_stmt(ir, last);
+		ir_emit(ir, IR_CONST, NULL, NULL, 0);
+	}
+}
+
 static void 
 ir_expr(IRProgram *ir, Node *node)
 {
@@ -1089,7 +1144,7 @@ ir_expr(IRProgram *ir, Node *node)
 
 	switch (node->kind) {
 	case ND_BLOCK:
-		ir_list(ir, node->body);
+		ir_block_expr(ir, node);
 		return;
 
 	case ND_NUM:
@@ -1097,6 +1152,13 @@ ir_expr(IRProgram *ir, Node *node)
 		return;
 
 	case ND_VAR:
+		/* C array-to-pointer decay: local arrays used as rvalues produce
+		 * their address.  Do not emit a scalar load from the first bytes.
+		 */
+		if (node->type && node->type->kind == TY_ARRAY) {
+			ir_emit(ir, IR_LOAD, "addr_local", node->name, node->offset);
+			return;
+		}
 		ir_emit_ex(ir, IR_LOAD, "local", node->name, node->offset,
 		           node->is_pointer ? 8 : (node->elem_size ? node->elem_size : 4));
 		return;
@@ -1286,6 +1348,11 @@ ir_expr(IRProgram *ir, Node *node)
 
 	case ND_DEREF:
 		ir_expr(ir, node->left);
+		/* If the dereferenced type is itself an array (e.g. g->init_syms[slot]
+		 * where init_syms is char[128][64], giving a char[64] element), the result
+		 * decays to a pointer — leave the address on the stack, don't load. */
+		if (node->type && node->type->kind == TY_ARRAY)
+			return;
 		ir_emit(ir, IR_UNOP, "load_deref", NULL, node->elem_size ? node->elem_size : 4);
 		return;
 

@@ -204,6 +204,8 @@ new_deref(Node *expr)
 			node->elem_size = 8;
 		else if (expr->type->base->kind == TY_STRUCT)
 			node->elem_size = expr->type->base->size;
+		else if (expr->type->base->kind == TY_ARRAY)
+			node->elem_size = expr->type->base->size;
 		else
 			node->elem_size = 4;
 	} else {
@@ -678,6 +680,24 @@ replace_with_num(Node *node, int value)
 	return node;
 }
 
+
+static Node *
+preserve_replacement_next(Node *replacement, Node *original)
+{
+	if (!replacement || !original)
+		return replacement;
+
+	/* fold_constants() is called on statement-list nodes as well as
+	 * expression trees.  When a node is replaced with one of its children
+	 * (for example constant-folding a conditional expression), keep the
+	 * original statement-list chain intact.  Otherwise the statement after
+	 * the folded expression can be silently dropped.
+	 */
+	if (!replacement->next)
+		replacement->next = original->next;
+	return replacement;
+}
+
 Node *
 fold_constants(Node *node)
 {
@@ -778,30 +798,30 @@ fold_constants(Node *node)
 	if (node->kind == ND_COND && node->cond && node->then_body && node->else_body &&
 	        node->cond->kind == ND_NUM) {
 		Node *chosen = node->cond->value ? node->then_body : node->else_body;
-		return fold_constants(chosen);
+		return preserve_replacement_next(fold_constants(chosen), node);
 	}
 
 	/* v78 algebraic identities: safe simplifications without side effects. */
 	if (node->kind == ND_ADD && is_num(node->right) && node->right->value == 0)
-		return node->left;
+		return preserve_replacement_next(node->left, node);
 	if (node->kind == ND_ADD && is_num(node->left) && node->left->value == 0)
-		return node->right;
+		return preserve_replacement_next(node->right, node);
 	if (node->kind == ND_SUB && is_num(node->right) && node->right->value == 0)
-		return node->left;
+		return preserve_replacement_next(node->left, node);
 	if (node->kind == ND_MUL && is_num(node->right) && node->right->value == 1)
-		return node->left;
+		return preserve_replacement_next(node->left, node);
 	if (node->kind == ND_MUL && is_num(node->left) && node->left->value == 1)
-		return node->right;
+		return preserve_replacement_next(node->right, node);
 	if (node->kind == ND_DIV && is_num(node->right) && node->right->value == 1)
-		return node->left;
+		return preserve_replacement_next(node->left, node);
 	if (node->kind == ND_BITOR && is_num(node->right) && node->right->value == 0)
-		return node->left;
+		return preserve_replacement_next(node->left, node);
 	if (node->kind == ND_BITXOR && is_num(node->right) && node->right->value == 0)
-		return node->left;
+		return preserve_replacement_next(node->left, node);
 	if (node->kind == ND_SHL && is_num(node->right) && node->right->value == 0)
-		return node->left;
+		return preserve_replacement_next(node->left, node);
 	if (node->kind == ND_SHR && is_num(node->right) && node->right->value == 0)
-		return node->left;
+		return preserve_replacement_next(node->left, node);
 
 	return node;
 }

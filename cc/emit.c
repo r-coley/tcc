@@ -376,6 +376,61 @@ emit_struct_lvalue_addr(Node *node, Codegen *cg)
 	}
 }
 
+
+static int
+node_can_yield_expression_value(Node *node)
+{
+	if (!node)
+		return 0;
+
+	switch (node->kind) {
+	case ND_DECL:
+	case ND_ARRAY_DECL:
+	case ND_PTR_DECL:
+	case ND_STRUCT_DECL:
+	case ND_LABEL:
+	case ND_GOTO:
+	case ND_CASE:
+	case ND_DEFAULT:
+	case ND_BREAK:
+	case ND_CONTINUE:
+	case ND_RETURN:
+	case ND_IF:
+	case ND_WHILE:
+	case ND_FOR:
+	case ND_DO_WHILE:
+	case ND_SWITCH:
+	case ND_ASM:
+		return 0;
+	default:
+		return 1;
+	}
+}
+
+static void
+emit_block_expr(Node *block, Codegen *cg)
+{
+	Node *last = NULL;
+
+	if (!block || !block->body) {
+		cg->emit_load_imm(0);
+		return;
+	}
+
+	for (Node *stmt = block->body; stmt; stmt = stmt->next)
+		last = stmt;
+
+	for (Node *stmt = block->body; stmt && stmt != last; stmt = stmt->next)
+		emit_statement(stmt, cg);
+
+	if (node_can_yield_expression_value(last)) {
+		emit_expr(last, cg);
+	} else {
+		emit_statement(last, cg);
+		cg->emit_load_imm(0);
+	}
+}
+
 static void 
 emit_expr(Node *node, Codegen *cg)
 {
@@ -403,6 +458,15 @@ emit_expr(Node *node, Codegen *cg)
 		return;
 
 	case ND_VAR:
+		/* C array-to-pointer decay: a local array used as an rvalue yields
+		 * the address of its first element, not the scalar stored at [array].
+		 * This is the real fix for calls such as token_set_text(text), where
+		 * text is a local char[].
+		 */
+		if (node->type && node->type->kind == TY_ARRAY) {
+			cg->emit_addr_local(node->offset);
+			return;
+		}
 		if (node->is_pointer)
 			cg->emit_load_ptr_local(node->offset);
 		else
@@ -825,7 +889,7 @@ emit_expr(Node *node, Codegen *cg)
 	}
 
 	case ND_BLOCK:
-		emit_statement(node, cg);
+		emit_block_expr(node, cg);
 		return;
 
 	case ND_DECL:
