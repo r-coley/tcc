@@ -1,0 +1,7 @@
+int
+main(void)
+{
+    switch (0)
+        void _Noreturn f(void);
+    return 0;
+}

@@ -1,0 +1,12 @@
+int
+main(void)
+{
+	int x = 0;
+
+	switch (x) {
+	default:
+		return 1;
+	default:
+		return 2;
+	}
+}

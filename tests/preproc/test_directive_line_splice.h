@@ -1,0 +1,1 @@
+#define TCC_SPLICE_HEADER_VALUE 42

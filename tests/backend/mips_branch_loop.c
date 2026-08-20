@@ -1,0 +1,15 @@
+int main(void) {
+    int i;
+    int sum;
+
+    i = 0;
+    sum = 0;
+
+    while (i < 5) {
+        if (i != 3)
+            sum = sum + i;
+        i = i + 1;
+    }
+
+    return sum;
+}

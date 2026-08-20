@@ -1,0 +1,30 @@
+typedef int (*old_inner)();
+typedef int (*proto_inner)(int *);
+typedef old_inner (*old_outer)();
+typedef proto_inner (*proto_outer)(int);
+
+struct holder { int pad; proto_outer fp; };
+
+int
+idp(int *p)
+{
+	return *p;
+}
+
+proto_inner
+ret_proto(int seed)
+{
+	(void)seed;
+	return idp;
+}
+
+old_outer maker;
+proto_outer maker = ret_proto;
+
+int
+main(void)
+{
+	struct holder h = { .fp = maker };
+	char c = 1;
+	return h.fp(0)(&c);
+}

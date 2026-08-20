@@ -1,0 +1,2 @@
+set -x
+tar cf tcc.tar Makefile cc tests Recommendations.MD

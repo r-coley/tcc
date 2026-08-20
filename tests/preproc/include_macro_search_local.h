@@ -1,0 +1,8 @@
+#ifndef INCLUDE_MACRO_SEARCH_LOCAL_H
+#define INCLUDE_MACRO_SEARCH_LOCAL_H
+
+#include "include_macro_search_inner.h"
+
+#define INCLUDE_MACRO_SEARCH_VALUE (INCLUDE_MACRO_SEARCH_INNER_VALUE + 23)
+
+#endif

@@ -1,0 +1,10 @@
+# Focused assembly-quality comparison set.
+# These are existing regression/runtime tests chosen to mirror the current
+# self-host hot spots: declarations, typedefs, function pointers, switches,
+# VLAs, and aggregate layout/initialization.
+
+tests/control/test_case_compound_block.c
+tests/type_semantics/test_array_nested_function_pointer_redecl_upgrade_compatible.c
+tests/type_semantics/test_function_redecl_typedef_fnparam_reverse_order.c
+tests/type_semantics/test_runtime_vla_return_expr.c
+tests/structs/test_pack1.c

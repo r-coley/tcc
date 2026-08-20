@@ -1,0 +1,1 @@
+int auto value;

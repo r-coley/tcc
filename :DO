@@ -1,0 +1,18 @@
+set -x
+(
+cd ~/Projects/Programming/c/sqlite/
+./MK
+)
+python3 /Users/rcoley/Projects/Programming/tcc/tools/compare_func_sizes.py \
+  --only-tcc-larger \
+  --min-percent-over 70 \
+  --show-percent \
+  --limit 40 \
+  /tmp/clang_foo /tmp/tcc_foo
+
+python3 /Users/rcoley/Projects/Programming/tcc/tools/compare_func_sizes.py \
+  --only-tcc-larger \
+  --min-percent-over 40 \
+  --show-percent \
+  --limit 40 \
+  build/tcc_stage0 build/tcc_stage1

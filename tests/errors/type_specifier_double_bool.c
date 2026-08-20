@@ -1,0 +1,1 @@
+double _Bool x;

@@ -1,0 +1,37 @@
+# x86 runtime manifest
+#
+# This starts conservatively with executable tests that correspond to the
+# x86 assembly smoke coverage.  Keep make test-x86-smoke as the fast assembly
+# regression gate, and grow this manifest toward x64 parity as runtime support
+# improves.
+
+run:core/test001.c::14
+run:core/test002.c::25
+run:control/test019.c::77
+run:pointers/test034.c::30
+run:loops/test045.c::10
+run:structs/test050.c::30
+run:globals/test060.c::42
+run:strings/test070.c::98
+
+run:backend/x86_call_args.c::52
+run:backend/x86_narrow_load_store.c::4
+run:backend/x86_signed_unsigned_cmp.c::2
+run:backend/x86_pointer_arith.c::42
+run:backend/x86_global_initializers.c::50
+run:backend/x86_global_arrays.c::42
+run:backend/x86_static_locals.c::42
+run:backend/x86_global_struct_fields.c::42
+run:backend/x86_string_global_ptr.c::42
+run:backend/x86_recursive_calls.c::0
+run:backend/x86_nested_call_args.c::0
+run:backend/x86_mutual_calls.c::0
+run:backend/x86_short_circuit.c::0
+run:backend/x86_nested_break_continue.c::1
+run:backend/x86_funcptr_basic.c::42
+run:backend/x86_funcptr_reassign.c::42
+run:backend/x86_funcptr_global.c::42
+run:backend/x86_funcptr_struct.c::42
+run:backend/x86_indirect_call_args.c::42
+
+# x86_extern_ptr.c is intentionally kept in test-x86-smoke only: it verifies
