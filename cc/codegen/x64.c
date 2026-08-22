@@ -10,23 +10,25 @@ static int x64_frame_stack_size;
 static int x64_internal_label_counter;
 static int x64_call_stack_adjust;
 
-/* Variadic register save area (SysV x86-64).
+/* Variadic register save area and cursor state (SysV x86-64).
  *
  * A variadic callee must be able to recover its variable arguments, which
- * the caller passed in the integer registers rdi,rsi,rdx,rcx,r8,r9. We spill
- * all six into a 48-byte area appended below the ordinary frame (arg0 at the
- * lowest address, arg5 at the highest) and point va_start at the slot for the
- * first variadic argument. This is what lets tcc-compiled variadic functions
- * and glibc variadics share one SysV-correct calling convention.
+ * the caller passed in rdi,rsi,rdx,rcx,r8,r9 and xmm0..xmm7. We spill both
+ * banks into the standard 176-byte SysV save area. A small cursor immediately
+ * before it tracks GP/FP offsets and the overflow stack address.
  *
  * x64_va_fixed_params: fixed (named) param count for the current function,
  *                      or -1 when the current function is not variadic.
- * x64_va_start_offset: signed rbp-relative byte offset of the first variadic
- *                      slot, valid only while emitting a variadic function.
+ * x64_va_start_offset: signed rbp-relative byte offset of the cursor.
  */
-#define X64_VA_SAVE_BYTES 48
+#define X64_VA_CURSOR_BYTES 32
+#define X64_VA_SAVE_BYTES 176
+#define X64_VA_FRAME_BYTES (X64_VA_CURSOR_BYTES + X64_VA_SAVE_BYTES)
 static int x64_va_fixed_params = -1;
 static int x64_va_start_offset = 0;
+static int x64_va_gp_offset;
+static int x64_va_fp_offset;
+static int x64_va_overflow_offset;
 
 /* Debug info state for .loc/.file directives.
  *
@@ -103,6 +105,13 @@ static void x64_func_start(const char *name, int is_static) {
      * a register save area. func_fixed_params returns -1 for non-variadic. */
     x64_va_fixed_params = func_fixed_params(name);
     x64_va_start_offset = 0;
+    x64_va_gp_offset = 0;
+    x64_va_fp_offset = 48;
+    x64_va_overflow_offset = 0;
+    if (x64_va_fixed_params >= 0)
+        func_x64_variadic_layout(name, &x64_va_gp_offset,
+                                 &x64_va_fp_offset,
+                                 &x64_va_overflow_offset);
     if (!is_static)
         printf(".global %s%s\n", TCC_ASM_SYM_PREFIX, name);
     printf("%s%s:\n", TCC_ASM_SYM_PREFIX, name);
@@ -126,20 +135,28 @@ static void x64_stack_alloc(int size) {
     if (size > 0)
         size = (size + 15) & ~15;
 
-    /* Variadic functions append a 48-byte GPR save area below the frame.
-     * Locals occupy [rbp-size .. rbp-8]; the save area then occupies
-     * [rbp-size-48 .. rbp-size-8], with save[k] (the k-th integer arg
-     * register) at rbp-size-48 + k*8, ascending. va_start points at the
-     * first variadic slot: rbp - size - 48 + fixed_params*8. */
+    /* Locals occupy [rbp-size .. rbp-8]. Variadic functions append a SysV
+     * cursor and the 48-byte GP plus 128-byte FP register-save banks. */
     if (x64_va_fixed_params >= 0) {
-        int base = size + X64_VA_SAVE_BYTES;
+        int base = size + X64_VA_FRAME_BYTES;
+        int cursor = -base;
+        int reg_save = cursor + X64_VA_CURSOR_BYTES;
         x64_frame_stack_size = base;
         printf("    sub rsp, %d\n", base);
         static const char *va_regs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
         for (int k = 0; k < 6; k++)
             printf("    mov QWORD PTR [rbp%+d], %s\n",
-                   -base + k * 8, va_regs[k]);
-        x64_va_start_offset = -base + x64_va_fixed_params * 8;
+                   reg_save + k * 8, va_regs[k]);
+        for (int k = 0; k < 8; k++)
+            printf("    movdqu XMMWORD PTR [rbp%+d], xmm%d\n",
+                   reg_save + 48 + k * 16, k);
+        printf("    mov DWORD PTR [rbp%+d], %d\n", cursor, x64_va_gp_offset);
+        printf("    mov DWORD PTR [rbp%+d], %d\n", cursor + 4, x64_va_fp_offset);
+        printf("    lea rax, [rbp+%d]\n", 16 + x64_va_overflow_offset);
+        printf("    mov QWORD PTR [rbp%+d], rax\n", cursor + 8);
+        printf("    lea rax, [rbp%+d]\n", reg_save);
+        printf("    mov QWORD PTR [rbp%+d], rax\n", cursor + 16);
+        x64_va_start_offset = cursor;
         return;
     }
 
@@ -1351,9 +1368,75 @@ static void x64_store_global_extern(const char *name) {
 }
 
 static void x64_va_start(void) {
-    /* Leave the address of the first variadic argument's save slot in rax.
-     * x64_va_start_offset was computed in the prologue for this function. */
+    /* Leave the address of the function-local SysV va_list cursor in rax. */
     printf("    lea rax, [rbp%+d]\n", x64_va_start_offset);
+}
+
+static void x64_va_arg(int size, int is_fp, int complex_lanes) {
+    int id = x64_internal_label_counter++;
+    int limit = is_fp ? 176 : 48;
+    int step = is_fp ? 16 * (complex_lanes ? complex_lanes : 1) : 8;
+
+    /* The expression stack holds the va_list cursor. Select the matching
+     * SysV register bank while it has capacity, otherwise use overflow_arg. */
+    printf("    pop r11\n");
+    printf("    mov ecx, DWORD PTR [r11%+d]\n", is_fp ? 4 : 0);
+    printf("    cmp ecx, %d\n", limit - step);
+    printf("    jae Lx64vaoverflow%d\n", id);
+    printf("    mov rdx, QWORD PTR [r11+16]\n");
+    printf("    add rdx, rcx\n");
+    printf("    add ecx, %d\n", step);
+    printf("    mov DWORD PTR [r11%+d], ecx\n", is_fp ? 4 : 0);
+	if (complex_lanes == 2)
+		printf("    xor r8d, r8d\n");
+    printf("    jmp Lx64vadone%d\n", id);
+    printf("Lx64vaoverflow%d:\n", id);
+    printf("    mov rdx, QWORD PTR [r11+8]\n");
+    if (complex_lanes == 2) {
+        /* _Complex double requires 16-byte overflow-area alignment. */
+        printf("    add rdx, 15\n");
+        printf("    and rdx, -16\n");
+        printf("    lea rax, [rdx+16]\n");
+        printf("    mov QWORD PTR [r11+8], rax\n");
+    } else {
+        printf("    add QWORD PTR [r11+8], 8\n");
+    }
+	if (complex_lanes == 2)
+		printf("    mov r8d, 1\n");
+    printf("Lx64vadone%d:\n", id);
+    if (complex_lanes) {
+        if (complex_lanes == 1) {
+            /* SysV passes _Complex float as one eight-byte SSE value. */
+            printf("    movq xmm0, QWORD PTR [rdx]\n");
+        } else {
+            const char *move = size / complex_lanes == 4 ? "movss" : "movsd";
+            const char *width = size / complex_lanes == 4 ? "DWORD" : "QWORD";
+            printf("    %s xmm0, %s PTR [rdx]\n", move, width);
+			printf("    test r8d, r8d\n");
+			printf("    jnz Lx64vaoverflowlane%d\n", id);
+			printf("    %s xmm1, %s PTR [rdx+16]\n", move, width);
+			printf("    jmp Lx64valanesdone%d\n", id);
+			printf("Lx64vaoverflowlane%d:\n", id);
+			printf("    %s xmm1, %s PTR [rdx+8]\n", move, width);
+			printf("Lx64valanesdone%d:\n", id);
+        }
+    } else if (is_fp && size == 4)
+        printf("    mov eax, DWORD PTR [rdx]\n");
+    else
+        printf("    mov rax, QWORD PTR [rdx]\n");
+}
+
+static void x64_va_copy(int local_offset) {
+    /* Copy gp/fp offsets, overflow_arg_area, and reg_save_area into an
+     * independent compiler-managed cursor, then leave its address in rax. */
+    printf("    pop r11\n");
+    printf("    lea rax, [rbp%+d]\n", local_offset);
+    printf("    mov rcx, QWORD PTR [r11+0]\n");
+    printf("    mov QWORD PTR [rax+0], rcx\n");
+    printf("    mov rcx, QWORD PTR [r11+8]\n");
+    printf("    mov QWORD PTR [rax+8], rcx\n");
+    printf("    mov rcx, QWORD PTR [r11+16]\n");
+    printf("    mov QWORD PTR [rax+16], rcx\n");
 }
 
 Codegen x64_codegen = {
@@ -1485,7 +1568,9 @@ Codegen x64_codegen = {
     .emit_store_local_ptr_member = x64_store_local_ptr_member,
     .emit_store_local_ptr_member_from_local = NULL,
     .emit_va_start = x64_va_start,
+    .emit_va_arg = x64_va_arg,
     .emit_push_zero = NULL,
     .emit_cmp_branch_imm = NULL,
-    .emit_update_local_ptr_member_imm = NULL
+    .emit_update_local_ptr_member_imm = NULL,
+    .emit_va_copy = x64_va_copy
 };

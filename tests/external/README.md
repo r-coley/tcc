@@ -21,6 +21,8 @@ make test-conformance-external EXTERNAL_SUITE_MANIFEST=tests/external/<suite>.ma
 Notes:
 
 - `tests/torture` remains the current vendored external baseline.
+- `tests/external/c-testsuite-scc` is a second, revision-pinned external
+  baseline. Run it with `make test-conformance-external-ctestsuite-scc`.
 - New suites should prefer manifest mode over category filtering when their
   layout or expectations differ from the main in-tree manifest.
 - External suites should be recorded in `docs/CONFORMANCE_BASELINE.md` once

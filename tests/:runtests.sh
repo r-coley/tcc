@@ -32,6 +32,7 @@
 #   extra=path1.c,path2.c         compile extra sources with tcc in the same step
 #   clangextra=path1.c,path2.c    compile extra sources with clang and link them
 #                                 with the tcc-built primary source
+#   stdout=path.expected           compare program stdout with tests/path.expected
 #
 # Exit code: number of failed tests (0 = all passed).
 
@@ -237,11 +238,13 @@ while IFS= read -r entry; do
 
         extra_src=""
         clang_extra_src=""
+        expected_stdout=""
         clean_flags=""
         for f in $flags; do
             case "$f" in
                 extra=*) extra_src="${f#extra=}" ;;
                 clangextra=*) clang_extra_src="${f#clangextra=}" ;;
+                stdout=*) expected_stdout="${f#stdout=}" ;;
                 *) clean_flags="$clean_flags $f" ;;
             esac
         done
@@ -360,9 +363,22 @@ while IFS= read -r entry; do
             continue
         fi
 
+        out="$TMPDIR/${safename}.out"
         verbose_cmd "$exe"
-        "$exe" >/dev/null 2>>"$err"; actual=$?
-        if [ "$actual" = "$expected" ]; then
+        "$exe" >"$out" 2>>"$err"; actual=$?
+        stdout_ok=1
+        stdout_error=""
+        if [ "$actual" = "$expected" ] && [ -n "$expected_stdout" ]; then
+            expected_stdout_path="tests/$expected_stdout"
+            if [ ! -f "$expected_stdout_path" ]; then
+                stdout_ok=0
+                stdout_error="expected stdout file not found: $expected_stdout"
+            elif ! cmp -s "$out" "$expected_stdout_path"; then
+                stdout_ok=0
+                stdout_error="stdout differs from $expected_stdout"
+            fi
+        fi
+        if [ "$actual" = "$expected" ] && [ "$stdout_ok" -eq 1 ]; then
             pass=$((pass + 1))
             if [ "$type" = "todo" ]; then
                 [ "$last_newline" -eq 0 ] && echo
@@ -376,11 +392,20 @@ while IFS= read -r entry; do
         else
             [ "$last_newline" -eq 0 ] && echo
             if [ "$type" = "todo" ]; then
-                printf "SKIP %s (expected=%s actual=%s)\n" "$base" "$expected" "$actual"
+                if [ "$actual" != "$expected" ]; then
+                    printf "SKIP %s (expected=%s actual=%s)\n" "$base" "$expected" "$actual"
+                else
+                    printf "SKIP %s (%s)\n" "$base" "$stdout_error"
+                fi
                 [ -n "$desc" ] && printf "     note: %s\n" "$desc"
                 skip=$((skip + 1))
             else
-                printf "FAIL %s (expected=%s actual=%s)\n" "$base" "$expected" "$actual"
+                if [ "$actual" != "$expected" ]; then
+                    printf "FAIL %s (expected=%s actual=%s)\n" "$base" "$expected" "$actual"
+                else
+                    printf "FAIL %s (%s)\n" "$base" "$stdout_error"
+                    [ "$VERBOSE" -eq 1 ] && diff -u "$expected_stdout_path" "$out" >&2 || :
+                fi
                 fail=$((fail + 1))
             fi
             last_newline=1

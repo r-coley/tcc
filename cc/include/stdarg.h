@@ -83,7 +83,12 @@ static char *__tcc_va_base(void)
 #endif
 }
 
+#if defined(__x86_64__)
+typedef struct __tcc_va_cursor *__tcc_va_cursor_ptr;
+typedef __tcc_va_cursor_ptr va_list;
+#else
 typedef char *va_list;
+#endif
 #define _VA_LIST_DEFINED
 #define _VA_LIST
 
@@ -95,10 +100,15 @@ typedef char *va_list;
  * use the __tcc_va_base stack helper here.
  */
 #define va_start(ap, last)  ((ap) = __builtin_va_start((ap), (last)))
+#define va_arg(ap, type)    __builtin_va_arg((ap), type)
+#define va_copy(dest, src)  ((dest) = __builtin_va_copy((dest), (src)))
 #else
 #define va_start(ap, last)  ((ap) = __tcc_va_base())
+#define __TCC_VA_SLOT_SIZE(type) (((sizeof(type) + 7u) / 8u) * 8u)
+#define va_arg(ap, type)    (*(type *)((ap) += __TCC_VA_SLOT_SIZE(type), \
+                                       (ap) - __TCC_VA_SLOT_SIZE(type)))
+#define va_copy(dest, src)  ((dest) = (src))
 #endif
-#define va_arg(ap, type)    (*(type *)((ap) += 8, (ap) - 8))
 #define va_end(ap)          ((void)0)
 
 #endif /* __TCC__ && !defined(_VA_LIST) ... */

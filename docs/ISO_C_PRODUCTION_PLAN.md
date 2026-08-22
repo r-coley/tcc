@@ -41,12 +41,13 @@ Current verified baseline:
 
 ```text
 make stage2: pass
-make test: pass, stage0 10047/10047 and stage1 10047/10047
-make test-conformance-c99: pass, 2290/2290
-make test-conformance-c11: pass, 2302/2302
-make test-conformance-c17: pass, 2302/2302
-make test-conformance-c23: pass, 2303/2303
+make test: pass, stage0 10073/10073 and stage1 10073/10073
+make test-conformance-c99: pass, 2296/2296
+make test-conformance-c11: pass, 2308/2308
+make test-conformance-c17: pass, 2308/2308
+make test-conformance-c23: pass, 2309/2309
 make test-conformance-external-torture: pass, 220/220
+make test-conformance-external-ctestsuite-scc: pass, 43/43
 make test-sanitize: pass, 10039/10039 under ASAN+UBSAN
 make test-installed-smoke: pass
 make test-release-gates: pass
@@ -108,8 +109,9 @@ docs/C99_C11_PUNCH_LIST.md
 
 ## Track 2: External Validation
 
-Status: initial baseline in place via vendored `tests/torture`; installed
-compiler smoke and release-gate targets are also in place.
+Status: vendored baselines in place via `tests/torture` and the revision-pinned
+`tests/external/c-testsuite-scc` import; installed compiler smoke and release-
+gate targets are also in place.
 
 The in-tree test suite is still primarily a regression suite, not a complete
 conformance suite. Continue adding external test inputs and recording their
@@ -117,10 +119,8 @@ baselines.
 
 Next order:
 
-1. Add another external conformance suite beyond `tests/torture`.
-   The harness now exposes `make test-conformance-external` so new suites can
-   be plugged in by category or explicit manifest path without additional
-   Makefile restructuring.
+1. Expand the revision-pinned c-testsuite/SCC import beyond its current 43
+   portable freestanding C99/C11 cases, preserving source attribution.
 2. Add chibicc-style semantic tests where licensing and shape are acceptable.
 3. Add GCC torture subsets that are meaningful for the supported target.
 4. Keep sqlite amalgamation as an integration compile/run smoke test.
@@ -136,6 +136,7 @@ make test-conformance-c17
 make test-conformance-c23
 make test-conformance-external
 make test-conformance-external-torture
+make test-conformance-external-ctestsuite-scc
 make test-installed-smoke
 make test-sqlite-smoke
 make test-release-gates-core
@@ -238,9 +239,9 @@ that `SQLITE_SMOKE_DIR` points at a sqlite amalgamation tree.
 3. Convert more existing standards-relevant regression cases into explicit
    `-std=c99`, `-std=c11`, or selected `-std=c23` conformance entries where
    appropriate.
-4. Add another external conformance layer beyond `tests/torture`, using the
-   generic `test-conformance-external` hook so the next suite lands as data
-   rather than more harness-specific plumbing.
+4. Broaden the existing external layers using the generic
+   `test-conformance-external` hook, keeping imported subsets as data rather
+   than adding suite-specific runner code.
 5. Keep widening the explicit release gate itself, including future function-
    size and timing thresholds once those thresholds are formalized.
 6. Prioritize remaining work by standards impact and coverage value, not by

@@ -149,5 +149,7 @@ int parser_arm64_hfa_info_type(const Type *type, int *elem_size, int *elem_count
 
 /* Variadic call info */
 int func_fixed_params(const char *name); /* -1 if not variadic, else fixed param count */
+int func_x64_variadic_layout(const char *name, int *gp_offset,
+                             int *fp_offset, int *overflow_offset);
 
 #endif /* PARSER_H */

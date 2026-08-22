@@ -12989,7 +12989,8 @@ apply_argument_conversion(Type **param_types, int param_type_count,
 
 	is_variadic_tail = is_variadic && arg_index >= fixed_param_count;
 	if (is_variadic_tail) {
-		if (arg->type->kind == TY_FLOAT)
+		/* Default argument promotions widen real float, not _Complex float. */
+		if (type_is_fp_scalar(arg->type) && type_sizeof(arg->type) == 4)
 			return new_cast(arg, type_double());
 		if (arg->type->kind == TY_CHAR || arg->type->kind == TY_SHORT)
 			return new_cast(arg, type_int());
@@ -16615,6 +16616,36 @@ func_fixed_params(const char *name)
 	if (fi && fi->is_variadic)
 		return fi->fixed_param_count;
 	return -1;
+}
+
+int
+func_x64_variadic_layout(const char *name, int *gp_offset,
+                         int *fp_offset, int *overflow_offset)
+{
+	FuncInfo *fi = find_func(name);
+	int gp = 0, fp = 0, overflow = 0, i;
+
+	if (!fi || !fi->is_variadic)
+		return 0;
+	for (i = 0; i < fi->fixed_param_count && i < fi->param_type_count; i++) {
+		Type *type = fi->param_types ? fi->param_types[i] : NULL;
+		int fp_lanes = type_is_fp_scalar(type) ? 1 :
+		               (type_is_complex(type) ? 2 : 0);
+		if (fp_lanes) {
+			if (fp + fp_lanes <= 8)
+				fp += fp_lanes;
+			else
+				overflow += (type_sizeof(type) + 7) & ~7;
+		} else if (gp < 6) {
+			gp++;
+		} else {
+			overflow += (type_sizeof(type) + 7) & ~7;
+		}
+	}
+	if (gp_offset) *gp_offset = gp * 8;
+	if (fp_offset) *fp_offset = 48 + fp * 16;
+	if (overflow_offset) *overflow_offset = overflow;
+	return 1;
 }
 
 

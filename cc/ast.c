@@ -1032,6 +1032,15 @@ type_pointer_assignment_compatible(const Type *dst, const Type *src,
 		return 0;
 	dst_base = type_pointee(dst);
 	src_base = type_pointee(src);
+	/* Preserve the historic character-pointer extension only outside an
+	 * explicitly selected ISO dialect.  ISO C treats char, signed char, and
+	 * unsigned char as distinct, incompatible pointed-to types. */
+	if (!tcc_iso_diagnostics && dst_base && src_base &&
+	    dst_base->kind == TY_CHAR && src_base->kind == TY_CHAR) {
+		int dst_quals = type_assignment_relevant_qualifiers(type_qualifiers(dst_base));
+		int src_quals = type_assignment_relevant_qualifiers(type_qualifiers(src_base));
+		return (dst_quals & src_quals) == src_quals;
+	}
 	if (!tcc_iso_diagnostics && dst_base && src_base &&
 	    ((type_is_void(dst_base) && type_is_function(src_base)) ||
 	     (type_is_void(src_base) && type_is_function(dst_base)))) {
@@ -1041,12 +1050,6 @@ type_pointer_assignment_compatible(const Type *dst, const Type *src,
 	}
 	if ((type_is_void(dst_base) || type_is_void(src_base)) &&
 	    type_is_object_pointer(dst) && type_is_object_pointer(src)) {
-		int dst_quals = type_assignment_relevant_qualifiers(type_qualifiers(dst_base));
-		int src_quals = type_assignment_relevant_qualifiers(type_qualifiers(src_base));
-		return (dst_quals & src_quals) == src_quals;
-	}
-	if (dst_base && src_base &&
-	    dst_base->kind == TY_CHAR && src_base->kind == TY_CHAR) {
 		int dst_quals = type_assignment_relevant_qualifiers(type_qualifiers(dst_base));
 		int src_quals = type_assignment_relevant_qualifiers(type_qualifiers(src_base));
 		return (dst_quals & src_quals) == src_quals;

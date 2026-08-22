@@ -114,6 +114,8 @@ typedef enum {
 	IR_OP_STACK_RESTORE,/* "stack_restore" */
 	IR_OP_STACK_ALLOC,  /* "stack_alloc"  */
 	IR_OP_VA_START,     /* "va_start"     */
+	IR_OP_VA_ARG,       /* "va_arg"       */
+	IR_OP_VA_COPY,      /* "va_copy"      */
 	IR_OP_VIA_SAVED,    /* "via_saved"   */
 	IR_OP_VIA_SAVED_OFF,/* "via_saved_off" */
 	IR_OP_LOAD_VIA_SAVED,/* "load_via_saved" */
@@ -131,12 +133,31 @@ typedef enum {
 	IR_OP_ARM64_STORE_RET_HFA_GLOBAL, /* "arm64_store_ret_hfa_global" */
 	IR_OP_ARM64_ARG_HFA_LOCAL, /* "arm64_arg_hfa_local" */
 	IR_OP_ARM64_ARG_HFA_GLOBAL, /* "arm64_arg_hfa_global" */
+	IR_OP_ARM64_ARG_HFA_STACK_LOCAL, /* "arm64_arg_hfa_stack_local" */
+	IR_OP_ARM64_ARG_HFA_STACK_GLOBAL, /* "arm64_arg_hfa_stack_global" */
+	IR_OP_ARM64_PUSH_SCALAR_LOCAL, /* "arm64_push_scalar_local" */
+	IR_OP_ARM64_PUSH_SCALAR_GLOBAL, /* "arm64_push_scalar_global" */
+	IR_OP_ARM64_PUSH_PAIR_LOCAL, /* "arm64_push_pair_local" */
+	IR_OP_ARM64_PUSH_PAIR_GLOBAL, /* "arm64_push_pair_global" */
+	IR_OP_ARM64_ARG_GPR_LOCAL, /* "arm64_arg_gpr_local" */
+	IR_OP_ARM64_ARG_AGG_LOCAL, /* "arm64_arg_agg_local" */
+	IR_OP_ARM64_ARG_AGG_GLOBAL, /* "arm64_arg_agg_global" */
+	IR_OP_ARM64_CALL_STACK_ALLOC, /* "arm64_call_stack_alloc" */
+	IR_OP_ARM64_ARG_AGG_STACK_LOCAL, /* "arm64_arg_agg_stack_local" */
+	IR_OP_ARM64_ARG_AGG_STACK_GLOBAL, /* "arm64_arg_agg_stack_global" */
+	IR_OP_ARM64_CALL_STACK_FREE, /* "arm64_call_stack_free" */
 	IR_OP_X64_RET_FP_AGG_LOCAL, /* "x64_ret_fp_agg_local" */
 	IR_OP_X64_RET_FP_AGG_GLOBAL, /* "x64_ret_fp_agg_global" */
 	IR_OP_X64_STORE_RET_FP_AGG_LOCAL, /* "x64_store_ret_fp_agg_local" */
 	IR_OP_X64_STORE_RET_FP_AGG_GLOBAL, /* "x64_store_ret_fp_agg_global" */
 	IR_OP_X64_ARG_FP_AGG_LOCAL, /* "x64_arg_fp_agg_local" */
 	IR_OP_X64_ARG_FP_AGG_GLOBAL, /* "x64_arg_fp_agg_global" */
+	IR_OP_X64_ARG_FP_SCALAR_LOCAL, /* "x64_arg_fp_scalar_local" */
+	IR_OP_X64_CALL_STACK_ALLOC, /* "x64_call_stack_alloc" */
+	IR_OP_X64_ARG_FP_AGG_STACK_LOCAL, /* "x64_arg_fp_agg_stack_local" */
+	IR_OP_X64_ARG_FP_AGG_STACK_GLOBAL, /* "x64_arg_fp_agg_stack_global" */
+	IR_OP_X64_ARG_FP_SCALAR_STACK_LOCAL, /* "x64_arg_fp_scalar_stack_local" */
+	IR_OP_X64_ARG_GPR_LOCAL, /* "x64_arg_gpr_local" */
 	/* IR_BINOP sub-ops */
 	IR_OP_ADD,          /* "add"         */
 	IR_OP_SUB,          /* "sub"         */
@@ -201,6 +222,7 @@ typedef struct IRInst {
 	int result_is_fp;  /* for IR_CALL*: return value is in FP return register */
 	int fp_size;       /* for IR_BINOP/IR_BRANCH: operands are floating bits */
 	int extra;         /* target-specific auxiliary payload */
+	int x64_stack_arg_bytes; /* explicit x64 outgoing aggregate stack area */
 	unsigned int fp_arg_mask;        /* for IR_CALL*: arg i is floating */
 	unsigned int fp_arg_double_mask; /* for IR_CALL*: arg i is 8-byte float */
 	uint8_t simple_call_arg_count;   /* for IR_CALL: direct pure GPR args */

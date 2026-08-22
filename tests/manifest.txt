@@ -13,6 +13,7 @@
 
 # ---------------------------------------------------------------------------
 # Run tests
+run:core/test_harness_stdout.c:stdout=core/test_harness_stdout.expected:0
 run:abi/test_many_call_args.c::42
 run:abi/test086.c::36
 run:abi/test087.c::8
@@ -178,6 +179,18 @@ run:abi/test141_complex_float_nested_args.c:-std=c99:42
 run:abi/test141_complex_float_nested_args.c:-std=c11:42
 run:abi/test141_complex_float_nested_args.c:-std=c17:42
 run:abi/test141_complex_float_nested_args.c:-std=c23:42
+run:abi/test142_complex_double_variadic_tail.c:-std=c99:42
+run:abi/test142_complex_double_variadic_tail.c:-std=c11:42
+run:abi/test142_complex_double_variadic_tail.c:-std=c17:42
+run:abi/test142_complex_double_variadic_tail.c:-std=c23:42
+run:abi/test143_complex_float_variadic_tail.c:-std=c99:42
+run:abi/test143_complex_float_variadic_tail.c:-std=c11:42
+run:abi/test143_complex_float_variadic_tail.c:-std=c17:42
+run:abi/test143_complex_float_variadic_tail.c:-std=c23:42
+run:abi/test144_complex_variadic_external.c:-std=c99 clangextra=abi/lib_test144_complex_variadic_external.c:42
+run:abi/test144_complex_variadic_external.c:-std=c11 clangextra=abi/lib_test144_complex_variadic_external.c:42
+run:abi/test144_complex_variadic_external.c:-std=c17 clangextra=abi/lib_test144_complex_variadic_external.c:42
+run:abi/test144_complex_variadic_external.c:-std=c23 clangextra=abi/lib_test144_complex_variadic_external.c:42
 run:type_semantics/test_static_local_typedef_struct_designated_initializer.c:-std=c99:42
 run:type_semantics/test_static_local_typedef_struct_designated_initializer.c:-std=c11:42
 run:type_semantics/test_static_local_typedef_struct_designated_initializer.c:-std=c17:42
@@ -5873,8 +5886,8 @@ run:type_semantics/test_pointer_call_qualifier_preserved.c:-std=c23:0
 run:type_semantics/test_void_pointer_roundtrip.c:-std=c23:42
 run:type_semantics/test_pointer_to_pointer_roundtrip.c:-std=c23:42
 run:type_semantics/test_trailing_const_pointee_decl.c:-std=c11:42
-run:type_semantics/test_char_pointer_signedness_compat.c:-std=c11:0
-run:type_semantics/test_char_pointer_signedness_compat.c:-std=c23:0
+error:type_semantics/test_char_pointer_signedness_compat.c:-std=c11:Incompatible pointer types in initializer
+error:type_semantics/test_char_pointer_signedness_compat.c:-std=c23:Incompatible pointer types in initializer
 run:type_semantics/test_enum_local_array_decl.c:-std=c11:0
 run:type_semantics/test_enum_local_pointer_decl.c:-std=c11:0
 run:type_semantics/test_extern_inline_gnu_attribute_definition.c:-std=c11:42
@@ -9088,6 +9101,10 @@ error:errors/assign_incompatible_integer_to_pointer.c:-std=c11:Incompatible inte
 error:errors/assign_incompatible_integer_to_pointer.c:-std=c17:Incompatible integer to pointer conversion in assignment
 error:errors/assign_incompatible_integer_to_pointer.c:-std=c23:Incompatible integer to pointer conversion in assignment
 error:errors/assign_incompatible_pointer.c::Incompatible pointer types in assignment
+error:errors/test_incompatible_char_pointer_assignment.c:-std=c99:Incompatible pointer types in assignment
+error:errors/test_incompatible_char_pointer_assignment.c:-std=c11:Incompatible pointer types in assignment
+error:errors/test_incompatible_char_pointer_assignment.c:-std=c17:Incompatible pointer types in assignment
+error:errors/test_incompatible_char_pointer_assignment.c:-std=c23:Incompatible pointer types in assignment
 error:errors/assign_incompatible_function_pointer.c::Incompatible pointer types in assignment
 error:errors/assign_voidptr_from_function_pointer.c:-std=c99:Incompatible pointer types in assignment
 error:errors/assign_voidptr_from_function_pointer.c:-std=c11:Incompatible pointer types in assignment
@@ -9311,6 +9328,10 @@ error:errors/static_pointer_to_array_nonconstant_initializer.c:-std=c11:Static p
 error:errors/static_pointer_to_array_nonconstant_initializer.c:-std=c17:Static pointer initializer must be constant address for now
 error:errors/static_pointer_to_array_nonconstant_initializer.c:-std=c23:Static pointer initializer must be constant address for now
 error:errors/cond_incompatible_pointer.c:-std=c99:Incompatible pointer types in conditional expression
+error:errors/test_incompatible_char_pointer_conditional.c:-std=c99:Incompatible pointer types in conditional expression
+error:errors/test_incompatible_char_pointer_conditional.c:-std=c11:Incompatible pointer types in conditional expression
+error:errors/test_incompatible_char_pointer_conditional.c:-std=c17:Incompatible pointer types in conditional expression
+error:errors/test_incompatible_char_pointer_conditional.c:-std=c23:Incompatible pointer types in conditional expression
 error:errors/cond_incompatible_pointer.c:-std=c11:Incompatible pointer types in conditional expression
 error:errors/cond_incompatible_pointer.c:-std=c17:Incompatible pointer types in conditional expression
 error:errors/cond_incompatible_pointer_integer_else.c:-std=c99:Incompatible pointer and integer types in conditional expression
@@ -9447,6 +9468,10 @@ error:errors/call_conditional_function_pointer_incompatible_arg.c:-std=c11:Incom
 error:errors/call_conditional_function_pointer_incompatible_arg.c:-std=c17:Incompatible pointer type for argument 1 of indirect call
 error:errors/call_conditional_function_pointer_incompatible_arg.c:-std=c23:Incompatible pointer type for argument 1 of indirect call
 error:errors/eq_nested_function_pointer_param_typedef_incompatible.c:-std=c99:Incompatible pointer types in comparison
+error:errors/test_incompatible_char_pointer_comparison.c:-std=c99:Incompatible pointer types in comparison
+error:errors/test_incompatible_char_pointer_comparison.c:-std=c11:Incompatible pointer types in comparison
+error:errors/test_incompatible_char_pointer_comparison.c:-std=c17:Incompatible pointer types in comparison
+error:errors/test_incompatible_char_pointer_comparison.c:-std=c23:Incompatible pointer types in comparison
 error:errors/eq_nested_function_pointer_param_typedef_incompatible.c:-std=c11:Incompatible pointer types in comparison
 error:errors/eq_nested_function_pointer_param_typedef_incompatible.c:-std=c17:Incompatible pointer types in comparison
 error:errors/eq_nested_function_pointer_param_typedef_incompatible.c:-std=c23:Incompatible pointer types in comparison
@@ -9901,8 +9926,9 @@ run:type_semantics/test_trailing_const_pointee_decl.c:-std=c17:42
 run:type_semantics/test_local_array_of_string_pointers.c:-std=c99:42
 run:type_semantics/test_local_array_of_string_pointers.c:-std=c11:42
 run:type_semantics/test_local_array_of_string_pointers.c:-std=c17:42
-run:type_semantics/test_char_pointer_signedness_compat.c:-std=c99:0
-run:type_semantics/test_char_pointer_signedness_compat.c:-std=c17:0
+error:type_semantics/test_char_pointer_signedness_compat.c:-std=c99:Incompatible pointer types in initializer
+error:type_semantics/test_char_pointer_signedness_compat.c:-std=c17:Incompatible pointer types in initializer
+run:type_semantics/test_char_pointer_signedness_compat.c::0
 run:type_semantics/test_compare_pointer_to_array_member.c:-std=c17:42
 run:type_semantics/test_explicit_cast_fnptr_assign_from_voidptr_fn.c::1
 run:type_semantics/test_struct_field_function_pointer_pointer_assign.c:-std=c99:42

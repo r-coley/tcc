@@ -22,6 +22,7 @@ TMP_DIR_CONFORMANCE_C23 = $(TMP_DIR)/conformance-c23
 EXTERNAL_SUITE_CATEGORY ?= torture
 EXTERNAL_SUITE_MANIFEST ?=
 TMP_DIR_CONFORMANCE_EXTERNAL = $(TMP_DIR)/conformance-external
+CONFORMANCE_EXTERNAL_CTESTSUITE_SCC_MANIFEST = $(TEST_DIR)/external/c-testsuite-scc.manifest.txt
 
 # ---------------------------------------------------------------------------
 # Stage0: the compiler built by the host toolchain (gcc)
@@ -219,8 +220,8 @@ CONFORMANCE_C23_MANIFEST = $(TMP_DIR)/manifest-conformance-c23.txt
 
 .PHONY: test-m68k-smoke all stage0 stage1 stage2 clean clobber test-stress test-nonboot-stdbool test-nonboot-stddef test-nonboot-c11-headers test-nonboot-stdint test-nonboot-stdatomic test-nonboot-system-headers test-installed-smoke compare-asm \
 	test test-native test-full test-stage0 test-stage0-success test-stage1 test-stage1-success test-asan test-sanitize audit audit-core-types smoketest install uninstall \
-	dump-ast test-cfg arm64 x86 test-x86 test-x86-runtime test-x86-smoke test-x86-aggregate-smoke test-x86-run test-x64 test-x64-smoke test-x64-run test-mips test-mips-smoke test-mips-run test-m68k-run test-backend-smoke test-backend-run test-debug-sections mips \
-	test-conformance-c99 test-conformance-c11 test-conformance-c17 test-conformance-c23 test-conformance-external test-conformance-external-torture test-sqlite-smoke test-release-gates-core test-release-gates-installed test-release-gates \
+	dump-ast test-cfg arm64 x86 test-x86 test-x86-runtime test-x86-smoke test-x86-aggregate-smoke test-x86-run test-x64 test-x64-smoke test-x64-run test-x64-complex-run test-mips test-mips-smoke test-mips-run test-m68k-run test-backend-smoke test-backend-run test-debug-sections mips \
+	test-conformance-c99 test-conformance-c11 test-conformance-c17 test-conformance-c23 test-conformance-external test-conformance-external-torture test-conformance-external-ctestsuite-scc test-sqlite-smoke test-release-gates-core test-release-gates-installed test-release-gates \
 	report-selfhost-func-sizes report-sqlite-func-sizes report-sqlite-stage-times report-release-metrics \
 	$(addprefix test-,$(TEST_CATEGORIES)) \
 	$(addprefix test-stage1-,$(TEST_CATEGORIES)) \
@@ -422,6 +423,9 @@ test-conformance-external: $(STAGE0) | $(TMP_DIR_CONFORMANCE_EXTERNAL)
 
 test-conformance-external-torture: EXTERNAL_SUITE_CATEGORY = torture
 test-conformance-external-torture: test-conformance-external
+
+test-conformance-external-ctestsuite-scc: EXTERNAL_SUITE_MANIFEST = $(CONFORMANCE_EXTERNAL_CTESTSUITE_SCC_MANIFEST)
+test-conformance-external-ctestsuite-scc: test-conformance-external
 
 $(SANITIZE_DIR):
 	@mkdir -p $@
@@ -877,6 +881,58 @@ test-x64: test-x64-smoke
 test-x64-smoke: $(STAGE0) | $(TMP_DIR)
 	@sh $(TEST_DIR)/backend/x64_smoke.sh -c $(STAGE0) -T $(TMP_DIR) -d $(TEST_DIR)
 
+# Execute focused x64 _Complex ABI probes.  This is kept independent from the
+# broader x64 backend run target while that target still contains unrelated
+# known failures.
+test-x64-complex-run: $(STAGE0) | $(TMP_DIR)
+	@set -u; \
+	TMP="$(TMP_DIR)/x64-complex-run"; \
+	mkdir -p "$$TMP"; \
+	fail=0; \
+	echo "x64 complex ABI execution test:"; \
+	run() { \
+		src="$$1"; extra="$$2"; expect="$$3"; name=$$(basename "$$src" .c); \
+		asm="$$TMP/$$name.s"; exe="$$TMP/$$name"; err="$$TMP/$$name.err"; \
+		if ! $(STAGE0) $(BOOT_FLAGS) -target=x64 -std=c11 -S "$$src" -o "$$asm" >"$$err" 2>&1; then \
+			echo "  FAIL $$name (compile)"; sed 's/^/    /' "$$err"; fail=$$((fail + 1)); return; \
+		fi; \
+		if ! $(X64_RUN_CC) $(X64_RUN_LDFLAGS) "$$asm" $$extra -o "$$exe" >>"$$err" 2>&1; then \
+			echo "  FAIL $$name (link)"; sed 's/^/    /' "$$err"; fail=$$((fail + 1)); return; \
+		fi; \
+		set +e; "$$exe"; got="$$?"; set -e; \
+		if [ "$$got" -eq "$$expect" ]; then echo "  PASS $$name"; else echo "  FAIL $$name (exit $$got, expected $$expect)"; fail=$$((fail + 1)); fi; \
+	}; \
+	run_tcc_callee() { \
+		src="$$1"; caller="$$2"; expect="$$3"; name=$$(basename "$$src" .c); \
+		asm="$$TMP/$$name.s"; exe="$$TMP/$$name"; err="$$TMP/$$name.err"; \
+		if ! $(STAGE0) $(BOOT_FLAGS) -target=x64 -std=c11 -S "$$src" -o "$$asm" >"$$err" 2>&1; then \
+			echo "  FAIL $$name (compile)"; sed 's/^/    /' "$$err"; fail=$$((fail + 1)); return; \
+		fi; \
+		if ! $(X64_RUN_CC) $(X64_RUN_LDFLAGS) "$$caller" "$$asm" -o "$$exe" >>"$$err" 2>&1; then \
+			echo "  FAIL $$name (link)"; sed 's/^/    /' "$$err"; fail=$$((fail + 1)); return; \
+		fi; \
+		set +e; "$$exe"; got="$$?"; set -e; \
+		if [ "$$got" -eq "$$expect" ]; then echo "  PASS $$name"; else echo "  FAIL $$name (exit $$got, expected $$expect)"; fail=$$((fail + 1)); fi; \
+	}; \
+	run tests/abi/test127_complex_float2.c "" 42; \
+	run tests/abi/test128_complex_double2.c "" 42; \
+	run tests/abi/test131_complex_mixed_args.c "" 42; \
+	run tests/abi/test130_complex_double2_external.c tests/abi/lib_test130_complex_double2_external.c 42; \
+	run tests/abi/test132_complex_mixed_args_external.c tests/abi/lib_test132_complex_mixed_args_external.c 42; \
+	run tests/abi/test142_complex_double_variadic_tail.c "" 42; \
+	run tests/abi/test143_complex_float_variadic_tail.c "" 42; \
+	run tests/abi/test144_complex_variadic_external.c tests/abi/lib_test144_complex_variadic_external.c 42; \
+	run_tcc_callee tests/abi/test145_complex_double_variadic_overflow.c tests/abi/lib_test145_complex_double_variadic_overflow.c 42; \
+	run_tcc_callee tests/abi/test146_complex_float_variadic_overflow.c tests/abi/lib_test146_complex_float_variadic_overflow.c 42; \
+	run tests/abi/test147_integer_variadic_overflow.c "" 42; \
+	run tests/abi/test148_va_copy.c "" 42; \
+	run tests/abi/test149_complex_scalar_fp_mixed_external.c tests/abi/lib_test149_complex_scalar_fp_mixed_external.c 42; \
+	run tests/abi/test150_complex_double_xmm_spill_external.c tests/abi/lib_test150_complex_double_xmm_spill_external.c 42; \
+	run tests/abi/test151_complex_double_xmm_spill_mixed_external.c tests/abi/lib_test151_complex_double_xmm_spill_mixed_external.c 42; \
+	run_tcc_callee tests/abi/test152_complex_double_xmm_spill_callee.c tests/abi/lib_test152_complex_double_xmm_spill_callee.c 42; \
+	run tests/abi/test153_complex_float_xmm_spill_external.c tests/abi/lib_test153_complex_float_xmm_spill_external.c 42; \
+	if [ "$$fail" -eq 0 ]; then echo "x64 complex ABI execution test OK"; else echo "x64 complex ABI execution test FAILED ($$fail failure(s))"; exit "$$fail"; fi
+
 # Execute a conservative subset of x64 backend tests. This is separate from
 # test-x64-smoke because it requires a host/toolchain that can link and run
 # x86_64 binaries. On Apple Silicon with Rosetta installed, use:
@@ -909,6 +965,9 @@ test-x64-run: $(STAGE0) | $(TMP_DIR)
 	}; \
 	run tests/backend/x64_funcptr_basic.c 42; \
 	run tests/backend/x64_funcptr_global.c 42; \
+	run tests/abi/test127_complex_float2.c 42; \
+	run tests/abi/test128_complex_double2.c 42; \
+	run tests/abi/test131_complex_mixed_args.c 42; \
 	run tests/backend/x64_funcptr_struct.c 42; \
 	run tests/backend/x64_funcptr_reassign.c 43; \
 	run tests/backend/x64_indirect_call_args.c 28; \
@@ -1373,6 +1432,7 @@ test-release-gates-core:
 	$(MAKE) TMP_DIR=$(TMP_DIR_RELEASE_CORE) test-conformance-c17; \
 	$(MAKE) TMP_DIR=$(TMP_DIR_RELEASE_CORE) test-conformance-c23; \
 	$(MAKE) TMP_DIR=$(TMP_DIR_RELEASE_CORE) test-conformance-external-torture; \
+	$(MAKE) TMP_DIR=$(TMP_DIR_RELEASE_CORE) test-conformance-external-ctestsuite-scc; \
 	$(MAKE) TMP_DIR=$(TMP_DIR_RELEASE_CORE) test-sanitize
 
 test-release-gates-installed:

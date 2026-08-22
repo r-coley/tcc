@@ -7,12 +7,13 @@ Current verified baseline:
 
 ```text
 make stage2: pass
-make test: pass, stage0 10047/10047 and stage1 10047/10047
-make test-conformance-c99: pass, 2290/2290
-make test-conformance-c11: pass, 2302/2302
-make test-conformance-c17: pass, 2302/2302
-make test-conformance-c23: pass, 2303/2303
+make test: pass, stage0 10073/10073 and stage1 10073/10073
+make test-conformance-c99: pass, 2296/2296
+make test-conformance-c11: pass, 2308/2308
+make test-conformance-c17: pass, 2308/2308
+make test-conformance-c23: pass, 2309/2309
 make test-conformance-external-torture: pass, 220/220
+make test-conformance-external-ctestsuite-scc: pass, 43/43
 make test-sanitize: pass, 10039/10039 under ASAN+UBSAN
 make test-installed-smoke: pass
 make test-release-gates: pass

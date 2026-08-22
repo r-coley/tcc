@@ -381,6 +381,7 @@ typedef struct Codegen {
      * Only x64 implements this (SysV register save area); other targets keep
      * the __tcc_va_base stack model and leave this NULL. */
     void (*emit_va_start)(void);
+    void (*emit_va_arg)(int size, int is_fp, int complex_lanes);
 
     /* Optional fused update for:
      *   global[index] = global[index] +/- local
@@ -813,6 +814,8 @@ typedef struct Codegen {
     void (*emit_call_saved_fp_args)(int count, int fixed_params,
                                     unsigned int fp_arg_mask,
                                     unsigned int fp_arg_double_mask);
+    /* Optional x64 SysV va_copy cursor clone. */
+    void (*emit_va_copy)(int local_offset);
 } Codegen;
 
 extern Codegen arm64_codegen;

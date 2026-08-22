@@ -259,6 +259,7 @@ static void ir_emit_cond_branch(IRProgram *ir, Node *node, int label, int branch
 static void ir_emit_return_expr(IRProgram *ir, Node *expr);
 static void ir_remove_range(IRProgram *program, IRInst *prev, IRInst *first, IRInst *last);
 static IRInst *ir_emit_pop(IRProgram *ir);
+static IRInst *ir_emit_store_local(IRProgram *ir, const char *name, int offset, int size);
 static IRInst *ir_emit_unary_op(IRProgram *ir, const char *op);
 static IRInst *ir_emit_shift_imm(IRProgram *ir, const char *op, long imm);
 static IRInst *ir_emit_cast(IRProgram *ir, int size, int is_unsigned);
@@ -341,6 +342,7 @@ static int ir_try_emit_arm64_variadic_tail_call0_direct_call_seq(Codegen *cg,
                                                                  int *current_debug_end_label,
                                                                  int *current_function_exit_label,
                                                                  int *skip_linear_until_label);
+static Type *ir_call_param_abi_type(const Node *call, int index);
 static void ir_trace_call_abi(const char *phase, Node *call);
 static int ir_try_emit_arm64_nested_call_acc_arg0_direct_call_seq(Codegen *cg,
                                                                   IRInst **inst_ptr,
@@ -414,7 +416,9 @@ ir_is_stack_builtin_call(const Node *node)
 	         (STRCMP(node->name, "__builtin_stack_save") == 0 ||
 	          STRCMP(node->name, "__builtin_stack_restore") == 0 ||
 	          STRCMP(node->name, "__builtin_stack_alloc") == 0)) ||
-	         STRCMP(node->name, "__builtin_va_start") == 0);
+		         STRCMP(node->name, "__builtin_va_start") == 0 ||
+	         STRCMP(node->name, "__builtin_va_arg") == 0 ||
+	         STRCMP(node->name, "__builtin_va_copy") == 0);
 }
 
 static int
@@ -590,6 +594,53 @@ static int
 ir_arm64_hfa_info_type(const Type *type, int *elem_size_out, int *elem_count_out)
 {
 	return parser_arm64_hfa_info_type(type, elem_size_out, elem_count_out);
+}
+
+static int
+ir_call_fixed_params(const Node *call)
+{
+	Type *func_type;
+	int is_variadic = 0;
+	int fixed_params = 0;
+
+	if (!call || call->kind != ND_CALL)
+		return -1;
+	if (!call->left && call->name[0])
+		return func_fixed_params(call->name);
+
+	func_type = call->left ? call->left->type : NULL;
+	if (func_type && type_is_pointer(func_type))
+		func_type = type_pointee(func_type);
+	if (!func_type || !type_is_function(func_type))
+		return -1;
+	if (!type_func_metadata(func_type, NULL, NULL, &is_variadic, &fixed_params))
+		return -1;
+	return is_variadic ? fixed_params : -1;
+}
+
+static unsigned int
+ir_arm64_variadic_stack_pair_mask(const Node *call, Node **args, int count,
+                                  int fixed_params)
+{
+	unsigned int mask = 0;
+	int i;
+
+	if (!call || !args || fixed_params < 0 || count <= 0)
+		return 0;
+
+	for (i = fixed_params; i < count && i < 32; i++) {
+		Type *abi_type = ir_call_param_abi_type(call, i);
+		const Type *type = abi_type ? abi_type : (args[i] ? args[i]->type : NULL);
+		int size;
+
+		if (!type)
+			continue;
+		size = type_sizeof((Type *)type);
+		if (size > 8 && size <= 16)
+			mask |= (1u << i);
+	}
+
+	return mask;
 }
 
 static Type *
@@ -797,6 +848,9 @@ ir_x64_emit_single_complex_double_call(IRProgram *ir, Node *call, int discard_re
 
 	if (!ir || !call || call->kind != ND_CALL || call->left || !call->name[0])
 		return 0;
+	/* va_arg is lowered as an IR builtin, never as an ABI-visible call. */
+	if (STRCMP(call->name, "__builtin_va_arg") == 0)
+		return 0;
 
 	arg = call->args;
 	if (!arg || arg->next)
@@ -839,26 +893,115 @@ ir_x64_emit_single_complex_double_call(IRProgram *ir, Node *call, int discard_re
 }
 
 static int
-ir_call_has_x64_complex_double_abi_arg(const Node *call)
+ir_arm64_emit_mixed_intregs_call(IRProgram *ir, Node *call, int discard_result)
 {
-	int index = 0;
+	typedef struct {
+		Node *expr;
+		Node *storage;
+		int offset;
+		int size;
+		int reg;
+		int regs;
+		int aggregate;
+		int stack;
+		int stack_offset;
+	} Arm64Arg;
+	Arm64Arg args[IR_SIMPLE_CALL_MAX_ARGS];
+	int count = 0;
+	int reg = 0;
+	int has_aggregate = 0;
+	int stack_bytes = 0;
+	IRInst *ci;
 
-	if (!call || call->kind != ND_CALL)
+	if (!ir || !call || call->kind != ND_CALL || call->left || !call->name[0])
+		return 0;
+	for (Node *arg = call->args; arg; arg = arg->next) {
+		Node *storage = arg;
+		int regs = 1;
+		int aggregate = 0;
+
+		if (count >= IR_SIMPLE_CALL_MAX_ARGS)
+			return 0;
+		while (storage && storage->kind == ND_CAST && storage->left)
+			storage = storage->left;
+		while (storage && storage->kind == ND_COMMA && storage->left && storage->right) {
+			ir_stmt(ir, storage->left);
+			storage = storage->right;
+		}
+		if (storage && storage->type &&
+		    (type_is_struct(storage->type) || type_is_union(storage->type)) &&
+		    parser_classify_aggregate_abi(storage->type, &regs) == AGGREGATE_ABI_INTREGS) {
+			aggregate = 1;
+			has_aggregate = 1;
+			if (storage->kind != ND_VAR && storage->kind != ND_GLOBAL)
+				return 0;
+		} else if (storage && storage->type &&
+		           (type_is_fp_scalar(storage->type) || type_is_complex(storage->type) ||
+		            type_is_struct(storage->type) || type_is_union(storage->type))) {
+			return 0;
+		}
+		if (reg + regs > 8) {
+			if (!aggregate)
+				return 0;
+			regs = 0;
+		}
+		args[count].expr = arg;
+		args[count].storage = storage;
+		args[count].size = aggregate ? type_sizeof(storage->type) : 8;
+		args[count].offset = aggregate && storage->kind == ND_VAR ? storage->offset :
+		                     (!aggregate ? ir_alloc_hidden_local_slot(8, 8) : 0);
+		args[count].reg = reg;
+		args[count].regs = regs;
+		args[count].aggregate = aggregate;
+		args[count].stack = aggregate && regs == 0;
+		args[count].stack_offset = args[count].stack ? stack_bytes : 0;
+		if (args[count].stack)
+			stack_bytes += (args[count].size + 7) & ~7;
+		reg += regs;
+		count++;
+	}
+	if (count == 0 || !has_aggregate)
 		return 0;
 
-	for (const Node *arg = call->args; arg; arg = arg->next, index++) {
-		Type *abi_type = ir_call_param_abi_type(call, index);
-		const char *abi_name = ir_call_param_abi_name(call, index);
-		Node *stripped = ir_x64_unwrap_direct_complex_arg(NULL, (Node *)arg, 0);
-
-		stripped = ir_x64_peel_direct_complex_storage(stripped);
-
-		if (ir_type_uses_x64_complex_double_abi(abi_type ? abi_type :
-		                                        stripped ? stripped->type : NULL) ||
-		    ir_is_x64_complex_double_abi_name(abi_name))
-			return 1;
+	for (int i = count - 1; i >= 0; i--) {
+		if (!args[i].aggregate) {
+			ir_expr(ir, args[i].expr);
+			ir_emit_store_local(ir, NULL, args[i].offset, 8);
+		}
 	}
-	return 0;
+	if (stack_bytes) {
+		if (!ir_emit_raw(ir, IR_UNOP, "arm64_call_stack_alloc", NULL,
+		                 (stack_bytes + 15) & ~15, 0))
+			return 0;
+	}
+	for (int i = 0; i < count; i++) {
+		IRInst *prep;
+		if (!args[i].aggregate)
+			prep = ir_emit_raw(ir, IR_UNOP, "arm64_arg_gpr_local", NULL,
+			                   args[i].offset, 8);
+		else if (args[i].stack && args[i].storage->kind == ND_VAR)
+			prep = ir_emit_raw(ir, IR_UNOP, "arm64_arg_agg_stack_local", NULL,
+			                   args[i].offset, args[i].size);
+		else if (args[i].stack)
+			prep = ir_emit_raw(ir, IR_UNOP, "arm64_arg_agg_stack_global",
+			                   args[i].storage->name, 0, args[i].size);
+		else if (args[i].storage->kind == ND_VAR)
+			prep = ir_emit_raw(ir, IR_UNOP, "arm64_arg_agg_local", NULL,
+			                   args[i].offset, args[i].size);
+		else
+			prep = ir_emit_raw(ir, IR_UNOP, "arm64_arg_agg_global",
+			                   args[i].storage->name, 0, args[i].size);
+		if (!prep)
+			return 0;
+		prep->extra = args[i].stack ? args[i].stack_offset : args[i].reg;
+		prep->fixed_params = args[i].regs;
+	}
+	ci = ir_emit_raw(ir, IR_CALL_PACKED_GPR, NULL, call->name, 0, discard_result);
+	if (ci && stack_bytes)
+		ci->x64_stack_arg_bytes = (stack_bytes + 15) & ~15;
+	if (ci && call->type && !type_is_struct(call->type) && !type_is_union(call->type))
+		ci->result_size = type_sizeof(call->type);
+	return ci != NULL;
 }
 
 static int
@@ -868,11 +1011,17 @@ ir_x64_emit_mixed_complex_double_gpr_call(IRProgram *ir, Node *call, int discard
 		IR_X64_COMPLEX_SRC_NONE = 0,
 		IR_X64_COMPLEX_SRC_LOCAL,
 		IR_X64_COMPLEX_SRC_GLOBAL,
-		IR_X64_COMPLEX_SRC_SCRATCH
+		IR_X64_COMPLEX_SRC_SCRATCH,
+		IR_X64_COMPLEX_SRC_FP_SCALAR
 	};
 	typedef struct IRX64ComplexArgSource {
 		int kind;
 		int offset;
+		int lanes;
+		int stack_offset;
+		int on_stack;
+		int gpr_offset;
+		int gpr_index;
 		const char *name;
 		Node *expr;
 	} IRX64ComplexArgSource;
@@ -883,17 +1032,23 @@ ir_x64_emit_mixed_complex_double_gpr_call(IRProgram *ir, Node *call, int discard
 	int gpr_count = 0;
 	int complex_reg_count = 0;
 	int has_complex = 0;
+	int stack_bytes = 0;
 	int fixed_params = -1;
 	IRInst *ci;
 
 	if (!ir || !call || call->kind != ND_CALL)
+		return 0;
+	/* stdarg builtins are lowered as IR operations, never ABI calls. */
+	if (STRCMP(call->name, "__builtin_va_start") == 0 ||
+	    STRCMP(call->name, "__builtin_va_arg") == 0 ||
+	    STRCMP(call->name, "__builtin_va_copy") == 0)
 		return 0;
 
 	for (Node *arg = call->args; arg; arg = arg->next) {
 		Type *abi_type;
 		const char *abi_name;
 		Node *stripped;
-		int uses_complex_double_abi;
+		int complex_lanes = 0;
 
 		if (count >= IR_SIMPLE_CALL_MAX_ARGS)
 			return 0;
@@ -903,15 +1058,27 @@ ir_x64_emit_mixed_complex_double_gpr_call(IRProgram *ir, Node *call, int discard
 		abi_name = ir_call_param_abi_name(call, count);
 		stripped = ir_x64_unwrap_direct_complex_arg(ir, arg, 0);
 		stripped = ir_x64_peel_direct_complex_storage(stripped);
-		uses_complex_double_abi =
-		    ir_type_uses_x64_complex_double_abi(abi_type ? abi_type :
-		                                        stripped ? stripped->type : NULL) ||
-		    ir_is_x64_complex_double_abi_name(abi_name);
+		if (ir_type_uses_x64_complex_float_abi(abi_type ? abi_type :
+		                                      stripped ? stripped->type : NULL) ||
+		    ir_is_x64_complex_float_abi_name(abi_name))
+			complex_lanes = 1;
+		else if (ir_type_uses_x64_complex_double_abi(abi_type ? abi_type :
+		                                             stripped ? stripped->type : NULL) ||
+		         ir_is_x64_complex_double_abi_name(abi_name))
+			complex_lanes = 2;
 
-		if (uses_complex_double_abi) {
-			if (complex_reg_count + 2 > 8)
-				return 0;
+		if (complex_lanes) {
 			has_complex = 1;
+			complex_args[count].lanes = complex_lanes;
+			if (complex_reg_count + complex_lanes > 8) {
+				/* SysV requires an SSE aggregate to use registers as a whole.
+				 * If its lanes do not all fit, pass the entire aggregate on stack. */
+				complex_args[count].on_stack = 1;
+				complex_args[count].stack_offset = stack_bytes;
+				stack_bytes += complex_lanes * 8;
+			} else {
+				complex_reg_count += complex_lanes;
+			}
 			if (stripped && stripped->kind == ND_VAR) {
 				complex_args[count].kind = IR_X64_COMPLEX_SRC_LOCAL;
 				complex_args[count].offset = stripped->offset;
@@ -920,23 +1087,44 @@ ir_x64_emit_mixed_complex_double_gpr_call(IRProgram *ir, Node *call, int discard
 				complex_args[count].kind = IR_X64_COMPLEX_SRC_GLOBAL;
 				complex_args[count].name = stripped->name;
 				complex_args[count].expr = arg;
-			} else if (stripped && stripped->kind == ND_CALL &&
-			           ir_node_returns_x64_complex_double_abi(stripped)) {
+		} else if (stripped && stripped->kind == ND_CALL &&
+		           ir_node_returns_x64_direct_complex_abi(stripped)) {
 				complex_args[count].kind = IR_X64_COMPLEX_SRC_SCRATCH;
 				complex_args[count].expr = arg;
-				complex_args[count].offset = ir_alloc_hidden_local_slot(16, 8);
+				complex_args[count].offset =
+					ir_alloc_hidden_local_slot(complex_lanes == 1 ? 8 : 16, 8);
 			} else {
 				return 0;
 			}
-			complex_reg_count += 2;
 		} else {
 			Type *arg_type = stripped ? stripped->type : NULL;
 
-			if (arg_type &&
-			    (type_is_fp_scalar(arg_type) || type_is_complex(arg_type) ||
-			     type_is_struct(arg_type) || type_is_union(arg_type)))
+			if (arg_type && type_is_fp_scalar(arg_type)) {
+				complex_args[count].kind = IR_X64_COMPLEX_SRC_FP_SCALAR;
+				complex_args[count].lanes = 1;
+				complex_args[count].offset =
+					ir_alloc_hidden_local_slot(type_sizeof(arg_type), type_sizeof(arg_type));
+				has_complex = 1;
+				if (complex_reg_count >= 8) {
+					complex_args[count].on_stack = 1;
+					complex_args[count].stack_offset = stack_bytes;
+					stack_bytes += 8;
+				} else {
+					complex_reg_count++;
+				}
+			} else if (arg_type &&
+			           (type_is_complex(arg_type) || type_is_struct(arg_type) ||
+			            type_is_union(arg_type)))
 				return 0;
-			gpr_args[gpr_count++] = arg;
+			else
+				{
+					if (gpr_count >= 6)
+						return 0;
+					gpr_args[gpr_count] = arg;
+					complex_args[count].gpr_index = gpr_count++;
+					complex_args[count].gpr_offset =
+						ir_alloc_hidden_local_slot(8, 8);
+				}
 		}
 
 		count++;
@@ -954,46 +1142,78 @@ ir_x64_emit_mixed_complex_double_gpr_call(IRProgram *ir, Node *call, int discard
 			Node *stripped = ir_x64_unwrap_direct_complex_arg(ir, complex_args[i].expr, 1);
 
 			if (!stripped || stripped->kind != ND_CALL ||
-			    !ir_node_returns_x64_complex_double_abi(stripped))
+			    !ir_node_returns_x64_direct_complex_abi(stripped))
 				return 0;
 			ir_expr(ir, stripped);
 			store_inst = ir_emit_raw(ir, IR_UNOP, "x64_store_ret_fp_agg_local", NULL,
-			                         complex_args[i].offset, 8);
+			                         complex_args[i].offset,
+			                         complex_args[i].lanes == 1 ? 8 : 8);
 			if (store_inst)
-				store_inst->fixed_params = 2;
+				store_inst->fixed_params = complex_args[i].lanes;
 			else
 				return 0;
 		} else if (complex_args[i].kind == IR_X64_COMPLEX_SRC_LOCAL ||
 		           complex_args[i].kind == IR_X64_COMPLEX_SRC_GLOBAL) {
 			(void)ir_x64_unwrap_direct_complex_arg(ir, complex_args[i].expr, 1);
+		} else if (complex_args[i].kind == IR_X64_COMPLEX_SRC_FP_SCALAR) {
+			ir_expr(ir, args[i]);
+			ir_emit_store_local(ir, NULL, complex_args[i].offset,
+			                    type_sizeof(args[i]->type));
 		} else if (complex_args[i].kind == IR_X64_COMPLEX_SRC_NONE) {
 			ir_expr(ir, args[i]);
+			if (stack_bytes)
+				ir_emit_store_local(ir, NULL, complex_args[i].gpr_offset, 8);
 		}
 	}
 
 	if (call->left)
 		ir_expr(ir, call->left);
 
+	if (stack_bytes) {
+		IRInst *alloc = ir_emit_raw(ir, IR_UNOP, "x64_call_stack_alloc", NULL,
+		                            (stack_bytes + 15) & ~15, 0);
+		if (!alloc)
+			return 0;
+	}
+
 	for (int i = 0, xmm_base = 0; i < count; i++) {
 		IRInst *prep = NULL;
+		const char *agg_local_op = complex_args[i].on_stack ?
+			"x64_arg_fp_agg_stack_local" : "x64_arg_fp_agg_local";
+		const char *agg_global_op = complex_args[i].on_stack ?
+			"x64_arg_fp_agg_stack_global" : "x64_arg_fp_agg_global";
 
 		switch (complex_args[i].kind) {
+		case IR_X64_COMPLEX_SRC_FP_SCALAR:
+			prep = ir_emit_raw(ir, IR_UNOP,
+			                   complex_args[i].on_stack ? "x64_arg_fp_scalar_stack_local" :
+			                                              "x64_arg_fp_scalar_local", NULL,
+			                   complex_args[i].offset, type_sizeof(args[i]->type));
+			break;
 		case IR_X64_COMPLEX_SRC_LOCAL:
 		case IR_X64_COMPLEX_SRC_SCRATCH:
-			prep = ir_emit_raw(ir, IR_UNOP, "x64_arg_fp_agg_local", NULL,
+			prep = ir_emit_raw(ir, IR_UNOP, agg_local_op, NULL,
 			                   complex_args[i].offset, 8);
 			break;
 		case IR_X64_COMPLEX_SRC_GLOBAL:
-			prep = ir_emit_raw(ir, IR_UNOP, "x64_arg_fp_agg_global", complex_args[i].name,
+			prep = ir_emit_raw(ir, IR_UNOP, agg_global_op, complex_args[i].name,
 			                   0, 8);
+			break;
+		case IR_X64_COMPLEX_SRC_NONE:
+			if (stack_bytes)
+				prep = ir_emit_raw(ir, IR_UNOP, "x64_arg_gpr_local", NULL,
+				                   complex_args[i].gpr_offset, 0);
 			break;
 		default:
 			break;
 		}
 		if (prep) {
-			prep->fixed_params = 2;
-			prep->extra = xmm_base;
-			xmm_base += 2;
+			prep->fixed_params = complex_args[i].lanes;
+			prep->extra = complex_args[i].on_stack ? complex_args[i].stack_offset : xmm_base;
+			if (!complex_args[i].on_stack)
+				xmm_base += complex_args[i].lanes;
+			if (prep->subop == IR_OP_X64_ARG_GPR_LOCAL)
+				prep->extra = complex_args[i].gpr_index;
 		}
 	}
 
@@ -1008,10 +1228,17 @@ ir_x64_emit_mixed_complex_double_gpr_call(IRProgram *ir, Node *call, int discard
 	}
 	if (ci) {
 		ci->extra = complex_reg_count;
+		ci->x64_stack_arg_bytes = stack_bytes ? ((stack_bytes + 15) & ~15) : 0;
+		if (ci->x64_stack_arg_bytes)
+			ci->value = 0; /* arguments were materialized outside the expression stack */
 		if (ir_type_uses_x64_complex_double_abi(call->type) ||
 		    ir_node_returns_x64_complex_double_abi(call)) {
 			ci->result_is_fp = 1;
 			ci->result_size = 16;
+		} else if (ir_type_uses_x64_complex_float_abi(call->type) ||
+		           ir_node_returns_x64_complex_float_abi(call)) {
+			ci->result_is_fp = 1;
+			ci->result_size = 8;
 		} else if (call->type && type_is_fp_scalar(call->type)) {
 			ci->result_is_fp = 1;
 			ci->result_size = type_sizeof(call->type);
@@ -1024,6 +1251,7 @@ static int
 ir_arm64_emit_single_intregs_aggregate_call(IRProgram *ir, Node *call, int discard_result)
 {
 	Node *arg;
+	int fixed_params;
 	int reg_count;
 	IRInst *ci;
 
@@ -1033,6 +1261,9 @@ ir_arm64_emit_single_intregs_aggregate_call(IRProgram *ir, Node *call, int disca
 
 	arg = call->args;
 	if (!arg || arg->next)
+		return 0;
+	fixed_params = ir_call_fixed_params(call);
+	if (fixed_params == 0)
 		return 0;
 	if (!arg->type || !type_is_struct(arg->type))
 		return 0;
@@ -1054,7 +1285,7 @@ ir_arm64_emit_single_intregs_aggregate_call(IRProgram *ir, Node *call, int disca
 
 	ci = ir_emit_raw(ir, IR_CALL_PACKED_GPR, NULL, call->name, reg_count, discard_result);
 	if (ci) {
-		ci->fixed_params = func_fixed_params(call->name);
+		ci->fixed_params = fixed_params;
 		if (call->type && type_is_fp_scalar(call->type)) {
 			ci->result_is_fp = 1;
 			ci->result_size = type_sizeof(call->type);
@@ -1071,10 +1302,14 @@ ir_arm64_emit_single_hfa_aggregate_call(IRProgram *ir, Node *call, int discard_r
 	const char *abi_name;
 	int elem_size;
 	int elem_count;
+	int fixed_params;
 	IRInst *prep;
 	IRInst *ci;
 
 	if (!ir || !call || call->kind != ND_CALL || call->left || !call->name[0])
+		return 0;
+	/* va_arg is lowered as an IR builtin, never as an ABI-visible call. */
+	if (STRCMP(call->name, "__builtin_va_arg") == 0)
 		return 0;
 	if (STRCMP(call->name, "check_complex_float_mix") == 0 ||
 	    STRCMP(call->name, "check_complex_double_mix") == 0 ||
@@ -1084,6 +1319,9 @@ ir_arm64_emit_single_hfa_aggregate_call(IRProgram *ir, Node *call, int discard_r
 
 	arg = call->args;
 	if (!arg || arg->next)
+		return 0;
+	fixed_params = ir_call_fixed_params(call);
+	if (fixed_params == 0)
 		return 0;
 
 	for (;;) {
@@ -1119,7 +1357,7 @@ ir_arm64_emit_single_hfa_aggregate_call(IRProgram *ir, Node *call, int discard_r
 
 	ci = ir_emit_raw(ir, IR_CALL_PACKED_GPR, NULL, call->name, elem_count, discard_result);
 	if (ci) {
-		ci->fixed_params = func_fixed_params(call->name);
+		ci->fixed_params = fixed_params;
 		if (call->type && type_is_fp_scalar(call->type)) {
 			ci->result_is_fp = 1;
 			ci->result_size = type_sizeof(call->type);
@@ -1164,10 +1402,12 @@ ir_arm64_emit_mixed_hfa_gpr_call(IRProgram *ir, Node *call, int discard_result)
 	int hfa_counts[IR_SIMPLE_CALL_MAX_ARGS];
 	int hfa_fp_bases[IR_SIMPLE_CALL_MAX_ARGS];
 	int hfa_is_global[IR_SIMPLE_CALL_MAX_ARGS];
+	int hfa_stack_offsets[IR_SIMPLE_CALL_MAX_ARGS];
 	int count;
 	int simple_count = 0;
 	int hfa_count = 0;
 	int fp_reg = 0;
+	int hfa_stack_bytes = 0;
 	int fixed_params;
 	int i;
 	IRInst *ci;
@@ -1193,6 +1433,8 @@ ir_arm64_emit_mixed_hfa_gpr_call(IRProgram *ir, Node *call, int discard_result)
 		}
 	}
 
+	fixed_params = ir_call_fixed_params(call);
+
 	for (i = 0; i < count; i++) {
 		Node *prefix_stmt = NULL;
 		Node *arg = ir_arm64_strip_direct_hfa_arg(ir, args[i], &prefix_stmt);
@@ -1200,18 +1442,23 @@ ir_arm64_emit_mixed_hfa_gpr_call(IRProgram *ir, Node *call, int discard_result)
 		const char *abi_name = ir_call_param_abi_name(call, i);
 		int elem_size;
 		int elem_count;
+		int is_variadic_tail = (fixed_params >= 0 && i >= fixed_params);
 
 		if (!arg) {
+			simple_count = -1;
+			break;
+		}
+		if (is_variadic_tail &&
+		    (ir_arm64_hfa_info_type(abi_type ? abi_type : arg->type,
+		                            &elem_size, &elem_count) ||
+		     parser_arm64_hfa_info_name(abi_name, &elem_size, &elem_count) ||
+		     (arg->type && type_is_fp_scalar(arg->type)))) {
 			simple_count = -1;
 			break;
 		}
 		if (ir_arm64_hfa_info_type(abi_type ? abi_type : arg->type,
 		                           &elem_size, &elem_count) ||
 		    parser_arm64_hfa_info_name(abi_name, &elem_size, &elem_count)) {
-			if (fp_reg + elem_count > 8) {
-				simple_count = -1;
-				break;
-			}
 			if (arg->kind != ND_VAR && arg->kind != ND_GLOBAL) {
 				simple_count = -1;
 				break;
@@ -1221,10 +1468,15 @@ ir_arm64_emit_mixed_hfa_gpr_call(IRProgram *ir, Node *call, int discard_result)
 			hfa_offsets[hfa_count] = arg->kind == ND_VAR ? arg->offset : 0;
 			hfa_sizes[hfa_count] = elem_size;
 			hfa_counts[hfa_count] = elem_count;
-			hfa_fp_bases[hfa_count] = fp_reg;
+			hfa_fp_bases[hfa_count] = fp_reg + elem_count <= 8 ? fp_reg : -1;
+			hfa_stack_offsets[hfa_count] =
+			    hfa_fp_bases[hfa_count] < 0 ? hfa_stack_bytes : 0;
+			if (hfa_fp_bases[hfa_count] < 0)
+				hfa_stack_bytes += elem_size * elem_count;
 			hfa_is_global[hfa_count] = (arg->kind == ND_GLOBAL);
+			if (hfa_fp_bases[hfa_count] >= 0)
+				fp_reg += elem_count;
 			hfa_count++;
-			fp_reg += elem_count;
 			continue;
 		}
 		if (arg->type && type_is_fp_scalar(arg->type)) {
@@ -1244,12 +1496,24 @@ ir_arm64_emit_mixed_hfa_gpr_call(IRProgram *ir, Node *call, int discard_result)
 		return 0;
 	}
 
+	if (hfa_stack_bytes &&
+	    !ir_emit_raw(ir, IR_UNOP, "arm64_call_stack_alloc", NULL,
+	                 (hfa_stack_bytes + 15) & ~15, 0)) {
+		xfree(args);
+		return 0;
+	}
 	for (i = 0; i < hfa_count; i++) {
 		IRInst *prep;
 
 		if (hfa_prefix_stmts[i])
 			ir_stmt(ir, hfa_prefix_stmts[i]);
-		if (hfa_is_global[i]) {
+		if (hfa_fp_bases[i] < 0 && hfa_is_global[i]) {
+			prep = ir_emit_raw(ir, IR_UNOP, "arm64_arg_hfa_stack_global",
+			                   hfa_names[i], 0, hfa_sizes[i]);
+		} else if (hfa_fp_bases[i] < 0) {
+			prep = ir_emit_raw(ir, IR_UNOP, "arm64_arg_hfa_stack_local", NULL,
+			                   hfa_offsets[i], hfa_sizes[i]);
+		} else if (hfa_is_global[i]) {
 			prep = ir_emit_raw(ir, IR_UNOP, "arm64_arg_hfa_global",
 			                   hfa_names[i], 0, hfa_sizes[i]);
 		} else {
@@ -1258,7 +1522,7 @@ ir_arm64_emit_mixed_hfa_gpr_call(IRProgram *ir, Node *call, int discard_result)
 		}
 		if (prep) {
 			prep->fixed_params = hfa_counts[i];
-			prep->extra = hfa_fp_bases[i];
+			prep->extra = hfa_fp_bases[i] < 0 ? hfa_stack_offsets[i] : hfa_fp_bases[i];
 		}
 	}
 
@@ -1276,7 +1540,6 @@ ir_arm64_emit_mixed_hfa_gpr_call(IRProgram *ir, Node *call, int discard_result)
 			}
 		}
 	} else {
-		fixed_params = func_fixed_params(call->name);
 		ci = ir_emit_call_direct(ir, call->name, simple_count, discard_result);
 		if (ci) {
 			ci->fixed_params = fixed_params;
@@ -1290,6 +1553,8 @@ ir_arm64_emit_mixed_hfa_gpr_call(IRProgram *ir, Node *call, int discard_result)
 		}
 	}
 
+	if (ci && hfa_stack_bytes)
+		ci->x64_stack_arg_bytes = (hfa_stack_bytes + 15) & ~15;
 	xfree(args);
 	return ci != NULL;
 }
@@ -1330,6 +1595,7 @@ ir_emit_arm64_direct_hfa_call_to_lvalue(IRProgram *ir, Node *dst, Node *call)
 		}
 	}
 
+	fixed_params = ir_call_fixed_params(call);
 	if (count == 1) {
 		Node *arg = ir_arm64_strip_direct_hfa_arg(ir, args[0], NULL);
 		Type *abi_type = ir_call_param_abi_type(call, 0);
@@ -1337,7 +1603,7 @@ ir_emit_arm64_direct_hfa_call_to_lvalue(IRProgram *ir, Node *dst, Node *call)
 		int arg_elem_size = 0;
 		int arg_elem_count = 0;
 
-		if (arg &&
+		if (fixed_params != 0 && arg &&
 		    (ir_arm64_hfa_info_type(abi_type ? abi_type : arg->type,
 		                            &arg_elem_size, &arg_elem_count) ||
 		     parser_arm64_hfa_info_name(abi_name, &arg_elem_size, &arg_elem_count)) &&
@@ -1373,15 +1639,22 @@ ir_emit_arm64_direct_hfa_call_to_lvalue(IRProgram *ir, Node *dst, Node *call)
 	}
 
 	ir_collect_call_fp_arg_masks(args, count, &fp_arg_mask, &fp_arg_double_mask);
+	if (fixed_params >= 0) {
+		for (int i = fixed_params; i < count && i < 32; i++) {
+			fp_arg_mask &= ~(1u << i);
+			fp_arg_double_mask &= ~(1u << i);
+		}
+	}
 	for (int i = count - 1; i >= 0; i--)
 		ir_expr(ir, args[i]);
 
-	fixed_params = func_fixed_params(call->name);
 	ci = ir_emit_call_direct(ir, call->name, count, 0);
 	if (ci) {
 		ci->fixed_params = fixed_params;
 		ci->fp_arg_mask = fp_arg_mask;
 		ci->fp_arg_double_mask = fp_arg_double_mask;
+		ci->extra = (int)ir_arm64_variadic_stack_pair_mask(call, args, count,
+		                                                   fixed_params);
 	}
 
 	if (dst->kind == ND_VAR) {
@@ -1532,7 +1805,13 @@ ir_emit_arm64_direct_aggregate_call_to_lvalue(IRProgram *ir, Node *dst, Node *ca
 	}
 
 	ir_collect_call_fp_arg_masks(args, count, &fp_arg_mask, &fp_arg_double_mask);
-	fixed_params = func_fixed_params(call->name);
+	fixed_params = ir_call_fixed_params(call);
+	if (fixed_params >= 0) {
+		for (int i = fixed_params; i < count && i < 32; i++) {
+			fp_arg_mask &= ~(1u << i);
+			fp_arg_double_mask &= ~(1u << i);
+		}
+	}
 
 	for (int i = count - 1; i >= 0; i--)
 		ir_expr(ir, args[i]);
@@ -1542,6 +1821,8 @@ ir_emit_arm64_direct_aggregate_call_to_lvalue(IRProgram *ir, Node *dst, Node *ca
 		ci->fixed_params = fixed_params;
 		ci->fp_arg_mask = fp_arg_mask;
 		ci->fp_arg_double_mask = fp_arg_double_mask;
+		ci->extra = (int)ir_arm64_variadic_stack_pair_mask(call, args, count,
+		                                                   fixed_params);
 		ci->result_size = size;
 	}
 
@@ -2449,6 +2730,46 @@ ir_emit_stack_builtin_call(IRProgram *ir, const Node *node, int discard_result)
 		return 1;
 	}
 
+	if (STRCMP(node->name, "__builtin_va_arg") == 0) {
+		IRInst *inst;
+		int size;
+		if (!node->args)
+			ICE("__builtin_va_arg expects a va_list argument");
+		size = node->type ? type_sizeof(node->type) : TCC_SIZEOF_INT;
+		if (size <= 0 || (size > TCC_SIZEOF_PTR &&
+		                  !(node->type && type_is_complex(node->type))))
+			fatal_cur("__builtin_va_arg currently supports scalar or complex x64 arguments only\n");
+		ir_expr(ir, node->args);
+		inst = ir_emit_raw(ir, IR_UNOP, "va_arg", NULL, size,
+		                   node->type && type_is_fp_scalar(node->type));
+		inst->fp_size = node->type && type_is_fp_scalar(node->type) ? size : 0;
+		if (node->type && type_is_complex(node->type))
+			inst->extra = size == 8 ? 1 : 2;
+		if (discard_result)
+			ir_emit_pop(ir);
+		return 1;
+	}
+
+	if (STRCMP(node->name, "__builtin_va_copy") == 0) {
+		IRInst *inst;
+		int local_offset;
+
+		if (!node->args || !node->args->next || node->args->next->next)
+			ICE("__builtin_va_copy expects destination and source arguments");
+		if (irgen.target_cg != &x64_codegen)
+			ICE("__builtin_va_copy is only lowered for x64");
+		/* The destination expression is only an assignment target in the
+		 * public macro. Allocate a distinct cursor and evaluate the source. */
+		local_offset = ir_alloc_hidden_local_slot(24, 8);
+		ir_expr(ir, node->args->next);
+		inst = ir_emit_raw(ir, IR_UNOP, "va_copy", NULL, local_offset, 0);
+		if (!inst)
+			ICE("failed to emit __builtin_va_copy");
+		if (discard_result)
+			ir_emit_pop(ir);
+		return 1;
+	}
+
 	return 0;
 }
 
@@ -3136,6 +3457,18 @@ ir_op_to_subop(const char *op)
 		if (STRCMP(op, "arm64_store_ret_hfa_global") == 0) return IR_OP_ARM64_STORE_RET_HFA_GLOBAL;
 		if (STRCMP(op, "arm64_arg_hfa_local") == 0) return IR_OP_ARM64_ARG_HFA_LOCAL;
 		if (STRCMP(op, "arm64_arg_hfa_global") == 0) return IR_OP_ARM64_ARG_HFA_GLOBAL;
+		if (STRCMP(op, "arm64_arg_hfa_stack_local") == 0) return IR_OP_ARM64_ARG_HFA_STACK_LOCAL;
+		if (STRCMP(op, "arm64_arg_hfa_stack_global") == 0) return IR_OP_ARM64_ARG_HFA_STACK_GLOBAL;
+		if (STRCMP(op, "arm64_push_scalar_local") == 0) return IR_OP_ARM64_PUSH_SCALAR_LOCAL;
+		if (STRCMP(op, "arm64_push_scalar_global") == 0) return IR_OP_ARM64_PUSH_SCALAR_GLOBAL;
+		if (STRCMP(op, "arm64_push_pair_local") == 0) return IR_OP_ARM64_PUSH_PAIR_LOCAL;
+		if (STRCMP(op, "arm64_push_pair_global") == 0) return IR_OP_ARM64_PUSH_PAIR_GLOBAL;
+		if (STRCMP(op, "arm64_arg_gpr_local") == 0) return IR_OP_ARM64_ARG_GPR_LOCAL;
+		if (STRCMP(op, "arm64_arg_agg_local") == 0) return IR_OP_ARM64_ARG_AGG_LOCAL;
+		if (STRCMP(op, "arm64_arg_agg_global") == 0) return IR_OP_ARM64_ARG_AGG_GLOBAL;
+		if (STRCMP(op, "arm64_call_stack_alloc") == 0) return IR_OP_ARM64_CALL_STACK_ALLOC;
+		if (STRCMP(op, "arm64_arg_agg_stack_local") == 0) return IR_OP_ARM64_ARG_AGG_STACK_LOCAL;
+		if (STRCMP(op, "arm64_arg_agg_stack_global") == 0) return IR_OP_ARM64_ARG_AGG_STACK_GLOBAL;
 		if (STRCMP(op, "acc_to_tmp") == 0)   return IR_OP_ACC_TO_TMP;
 		if (STRCMP(op, "acc_to_saved") == 0) return IR_OP_ACC_TO_SAVED;
 		if (STRCMP(op, "asm") == 0)          return IR_OP_NONE;
@@ -3253,6 +3586,8 @@ ir_op_to_subop(const char *op)
 		if (STRCMP(op, "via_saved") == 0)    return IR_OP_VIA_SAVED;
 		if (STRCMP(op, "via_saved_off") == 0) return IR_OP_VIA_SAVED_OFF;
 		if (STRCMP(op, "va_start") == 0)     return IR_OP_VA_START;
+		if (STRCMP(op, "va_arg") == 0)       return IR_OP_VA_ARG;
+		if (STRCMP(op, "va_copy") == 0)      return IR_OP_VA_COPY;
 		break;
 	case 'x':
 		if (STRCMP(op, "x64_ret_fp_agg_local") == 0) return IR_OP_X64_RET_FP_AGG_LOCAL;
@@ -3261,6 +3596,12 @@ ir_op_to_subop(const char *op)
 		if (STRCMP(op, "x64_store_ret_fp_agg_global") == 0) return IR_OP_X64_STORE_RET_FP_AGG_GLOBAL;
 		if (STRCMP(op, "x64_arg_fp_agg_local") == 0) return IR_OP_X64_ARG_FP_AGG_LOCAL;
 		if (STRCMP(op, "x64_arg_fp_agg_global") == 0) return IR_OP_X64_ARG_FP_AGG_GLOBAL;
+		if (STRCMP(op, "x64_arg_fp_scalar_local") == 0) return IR_OP_X64_ARG_FP_SCALAR_LOCAL;
+		if (STRCMP(op, "x64_call_stack_alloc") == 0) return IR_OP_X64_CALL_STACK_ALLOC;
+		if (STRCMP(op, "x64_arg_fp_agg_stack_local") == 0) return IR_OP_X64_ARG_FP_AGG_STACK_LOCAL;
+		if (STRCMP(op, "x64_arg_fp_agg_stack_global") == 0) return IR_OP_X64_ARG_FP_AGG_STACK_GLOBAL;
+		if (STRCMP(op, "x64_arg_fp_scalar_stack_local") == 0) return IR_OP_X64_ARG_FP_SCALAR_STACK_LOCAL;
+		if (STRCMP(op, "x64_arg_gpr_local") == 0) return IR_OP_X64_ARG_GPR_LOCAL;
 		if (STRCMP(op, "xor") == 0)          return IR_OP_XOR;
 		break;
 	}
@@ -3278,7 +3619,7 @@ ir_subop_is_unop(IRSubOp subop)
 {
 	if (subop >= IR_OP_NEG && subop <= IR_OP_USHR_IMM)
 		return 1;
-	if (subop >= IR_OP_STACK_SAVE && subop <= IR_OP_VA_START)
+	if (subop >= IR_OP_STACK_SAVE && subop <= IR_OP_VA_COPY)
 		return 1;
 	switch (subop) {
 	case IR_OP_UNSUPPORTED:
@@ -4552,6 +4893,10 @@ tail:
 		    ir_arm64_emit_mixed_hfa_gpr_call(ir, n, 1)) {
 			return;
 		}
+		if (irgen.target_cg == &arm64_codegen &&
+		    ir_arm64_emit_mixed_intregs_call(ir, n, 1)) {
+			return;
+		}
 		if (irgen.target_cg == &x64_codegen &&
 		    ir_x64_emit_single_complex_double_call(ir, n, 1)) {
 			return;
@@ -4861,6 +5206,38 @@ tail:
 		    n->right->aggregate_abi_class != AGGREGATE_ABI_INTREGS &&
 		    n->right->aggregate_abi_class != AGGREGATE_ABI_HFA) {
 			ir_mark_unsupported(ir, "arm64 byref struct return assignment");
+			return;
+		}
+		if (irgen.target_cg == &x64_codegen &&
+		    n->right && n->right->kind == ND_CALL &&
+		    STRCMP(n->right->name, "__builtin_va_arg") == 0 &&
+		    n->right->type &&
+		    (ir_type_uses_x64_complex_float_abi(n->right->type) ||
+		     ir_type_uses_x64_complex_double_abi(n->right->type)) &&
+		    n->left && n->left->type &&
+		    (ir_type_uses_x64_complex_float_abi(n->left->type) ||
+		     ir_type_uses_x64_complex_double_abi(n->left->type)) &&
+		    (n->left->kind == ND_VAR || n->left->kind == ND_GLOBAL)) {
+			IRInst *load;
+			IRInst *store;
+			int is_complex_float;
+			if (!n->right->args)
+				ICE("complex __builtin_va_arg expects a va_list argument");
+			/* SysV passes _Complex float in one packed SSE eightbyte, while
+			 * _Complex double uses two SSE eightbytes. */
+			is_complex_float = type_sizeof(n->right->type) == 8;
+			ir_expr(ir, n->right->args);
+			load = ir_emit_raw(ir, IR_UNOP, "va_arg", NULL,
+			                   type_sizeof(n->right->type), 1);
+			load->extra = is_complex_float ? 1 : 2;
+			store = ir_emit_raw(ir, IR_UNOP,
+			                    n->left->kind == ND_VAR ?
+			                    "x64_store_ret_fp_agg_local" :
+			                    "x64_store_ret_fp_agg_global",
+			                    n->left->kind == ND_GLOBAL ? n->left->name : NULL,
+			                    n->left->kind == ND_VAR ? n->left->offset : 0,
+			                   is_complex_float ? 8 : type_sizeof(n->right->type) / 2);
+			store->fixed_params = is_complex_float ? 1 : 2;
 			return;
 		}
 		if (irgen.target_cg == &x64_codegen &&
@@ -5752,6 +6129,7 @@ ir_expr(IRProgram *ir, Node *node)
 		Node **args;
 		int count;
 		int fixed_params;
+		unsigned int stack_pair_mask = 0;
 		unsigned int fp_arg_mask = 0;
 		unsigned int fp_arg_double_mask = 0;
 
@@ -5771,6 +6149,10 @@ ir_expr(IRProgram *ir, Node *node)
 		}
 		if (irgen.target_cg == &arm64_codegen &&
 		    ir_arm64_emit_mixed_hfa_gpr_call(ir, node, 0)) {
+			return;
+		}
+		if (irgen.target_cg == &arm64_codegen &&
+		    ir_arm64_emit_mixed_intregs_call(ir, node, 0)) {
 			return;
 		}
 		if (irgen.target_cg == &x64_codegen &&
@@ -5808,7 +6190,17 @@ ir_expr(IRProgram *ir, Node *node)
 			for (_arg = node->args; _arg; _arg = _arg->next) args[_ci++] = _arg;
 		}
 		ir_collect_call_fp_arg_masks(args, count, &fp_arg_mask, &fp_arg_double_mask);
-		fixed_params = node->left ? -1 : func_fixed_params(node->name);
+		fixed_params = ir_call_fixed_params(node);
+		if (irgen.target_cg == &arm64_codegen && fixed_params >= 0) {
+			/*
+			 * Keep unnamed floating arguments classified as FP until arm64 call
+			 * emission.  The arm64 backend converts and packs them into the
+			 * variadic stack area; clearing these bits lets integer-only call
+			 * sequence peepholes lose the floating value before that happens.
+			 */
+			stack_pair_mask = ir_arm64_variadic_stack_pair_mask(node, args, count,
+			                                                    fixed_params);
+		}
 
 		/*
 		 * Fast path for common one-argument direct calls where the
@@ -5838,10 +6230,9 @@ ir_expr(IRProgram *ir, Node *node)
 			return;
 		}
 
-		if (!node->left && count > 0 && count <= IR_SIMPLE_CALL_MAX_ARGS &&
-		    fp_arg_mask == 0 &&
-		    !(irgen.target_cg == &x64_codegen &&
-		      ir_call_has_x64_complex_double_abi_arg(node))) {
+		if (irgen.target_cg == &arm64_codegen &&
+		    !node->left && count > 0 && count <= IR_SIMPLE_CALL_MAX_ARGS &&
+		    fp_arg_mask == 0) {
 			IRSimpleCallArg simple_args[IR_SIMPLE_CALL_MAX_ARGS];
 			int simple_ok = 1;
 			int i;
@@ -5867,6 +6258,9 @@ ir_expr(IRProgram *ir, Node *node)
 					ci->result_is_fp = 1;
 					ci->result_size = type_sizeof(node->type);
 				}
+				if (irgen.target_cg == &arm64_codegen) {
+					ci->extra = (int)stack_pair_mask;
+				}
 				xfree(args);
 				return;
 			}
@@ -5877,8 +6271,49 @@ ir_expr(IRProgram *ir, Node *node)
 		/* Evaluate args right-to-left */
 		{
 			int _i;
-			for (_i = count - 1; _i >= 0; _i--)
+			for (_i = count - 1; _i >= 0; _i--) {
+				if (irgen.target_cg == &arm64_codegen && fixed_params >= 0 &&
+				    _i >= fixed_params) {
+					Node *storage = ir_x64_strip_direct_complex_arg(ir, args[_i]);
+
+					storage = ir_x64_peel_direct_complex_storage(storage);
+					if (storage && storage->type && type_is_complex(storage->type) &&
+					    type_sizeof(storage->type) == TCC_SIZEOF_PTR) {
+						if (storage->kind == ND_VAR) {
+							ir_emit_raw(ir, IR_UNOP, "arm64_push_scalar_local", NULL,
+							            storage->offset, TCC_SIZEOF_PTR);
+							continue;
+						}
+						if (storage->kind == ND_GLOBAL) {
+							ir_emit_raw(ir, IR_UNOP, "arm64_push_scalar_global",
+							            storage->name, 0, TCC_SIZEOF_PTR);
+							continue;
+						}
+					}
+				}
+				if (irgen.target_cg == &arm64_codegen &&
+				    (stack_pair_mask & (1u << _i))) {
+					Node *storage = ir_x64_strip_direct_complex_arg(ir, args[_i]);
+
+					storage = ir_x64_peel_direct_complex_storage(storage);
+					if (storage && storage->type &&
+					    type_sizeof(storage->type) > 8 &&
+					    type_sizeof(storage->type) <= 16) {
+						if (storage->kind == ND_VAR) {
+							ir_emit_raw(ir, IR_UNOP, "arm64_push_pair_local", NULL,
+							            storage->offset, type_sizeof(storage->type));
+							continue;
+						}
+						if (storage->kind == ND_GLOBAL) {
+							ir_emit_raw(ir, IR_UNOP, "arm64_push_pair_global",
+							            storage->name, 0,
+							            type_sizeof(storage->type));
+							continue;
+						}
+					}
+				}
 				ir_expr(ir, args[_i]);
+			}
 		}
 
 		if (node->left) {
@@ -5895,6 +6330,9 @@ ir_expr(IRProgram *ir, Node *node)
 					ci->fixed_params = -1;
 					ci->fp_arg_mask = fp_arg_mask;
 					ci->fp_arg_double_mask = fp_arg_double_mask;
+					if (irgen.target_cg == &arm64_codegen) {
+						ci->extra = (int)stack_pair_mask;
+					}
 				}
 			}
 		} else {
@@ -5903,6 +6341,9 @@ ir_expr(IRProgram *ir, Node *node)
 				_ci->fixed_params = fixed_params;
 				_ci->fp_arg_mask = fp_arg_mask;
 				_ci->fp_arg_double_mask = fp_arg_double_mask;
+				if (irgen.target_cg == &arm64_codegen) {
+					_ci->extra = (int)stack_pair_mask;
+				}
 				if (node->type &&
 				    (type_is_fp_scalar(node->type) ||
 				     ir_type_uses_x64_complex_float_abi(node->type))) {
@@ -5936,64 +6377,76 @@ ir_expr(IRProgram *ir, Node *node)
 		return;
 
 	case ND_ADDR:
-		if (node->left && node->left->kind == ND_VAR) {
-			ir_emit_load_addr_local(ir, node->left->name, node->left->offset);
+		{
+			Node *target = node->left;
+
+			/* Compound literals are represented as (initializers, lvalue).
+			 * Execute the initializer side effects before lowering the address
+			 * of the resulting lvalue. */
+			while (target && target->kind == ND_COMMA && target->left && target->right) {
+				ir_stmt(ir, target->left);
+				target = target->right;
+			}
+
+		if (target && target->kind == ND_VAR) {
+			ir_emit_load_addr_local(ir, target->name, target->offset);
 			return;
 		}
 
-		if (node->left && node->left->kind == ND_GLOBAL) {
-			ir_emit_load_addr_global(ir, node->left->name);
+		if (target && target->kind == ND_GLOBAL) {
+			ir_emit_load_addr_global(ir, target->name);
 			return;
 		}
 
-		if (node->left && node->left->kind == ND_DEREF) {
+		if (target && target->kind == ND_DEREF) {
 			const Node *base = NULL;
 			int offset = 0;
 
-			if (ir_const_ptr_byte_offset(node->left->left, &base, &offset)) {
+			if (ir_const_ptr_byte_offset(target->left, &base, &offset)) {
 				ir_expr(ir, (Node *)base);
 				if (offset)
 					ir_emit_add_offset(ir, offset);
 			} else {
-				ir_expr(ir, node->left->left);
+				ir_expr(ir, target->left);
 			}
 			return;
 		}
 
-			if (node->left && node->left->kind == ND_INDEX) {
+			if (target && target->kind == ND_INDEX) {
 				int local_offset = 0;
 				int local_size = 0;
 
-				ir_local_const_index_info(node->left, &local_offset, &local_size);
+				ir_local_const_index_info(target, &local_offset, &local_size);
 				if (local_size > 0) {
-					ir_emit_load_addr_local(ir, node->left->name, local_offset);
+					ir_emit_load_addr_local(ir, target->name, local_offset);
 					return;
 				}
-				ir_expr(ir, node->left->left);
-				ir_emit_unop_indexed(ir, "addr_indexed", node->left->name, node->left->offset, node->left->elem_size ? node->left->elem_size : 4);
+				ir_expr(ir, target->left);
+				ir_emit_unop_indexed(ir, "addr_indexed", target->name, target->offset, target->elem_size ? target->elem_size : 4);
 				return;
 			}
 
-		if (node->left && node->left->kind == ND_MEMBER) {
-			ir_emit_load_addr_local(ir, node->left->name, node->left->offset);
+		if (target && target->kind == ND_MEMBER) {
+			ir_emit_load_addr_local(ir, target->name, target->offset);
 			return;
 		}
 
-		if (node->left && node->left->kind == ND_MEMBER_PTR) {
-			ir_expr(ir, node->left->left);
-			ir_emit_add_offset(ir, node->left->offset);
+		if (target && target->kind == ND_MEMBER_PTR) {
+			ir_expr(ir, target->left);
+			ir_emit_add_offset(ir, target->offset);
 			return;
 		}
 
-		if (node->left && node->left->kind == ND_GLOBAL_INDEX) {
+		if (target && target->kind == ND_GLOBAL_INDEX) {
 			/* &arr[i] -> address of global array element */
-			ir_expr(ir, node->left->left); /* index */
-			ir_emit_unop_indexed(ir, "addr_gidx", node->left->name, 0, node->left->elem_size ? node->left->elem_size : 4);
+			ir_expr(ir, target->left); /* index */
+			ir_emit_unop_indexed(ir, "addr_gidx", target->name, 0, target->elem_size ? target->elem_size : 4);
 			return;
 		}
 
 		ir_mark_unsupported(ir, "address-of complex lvalue");
 		return;
+		}
 
 	case ND_DEREF:
 		if (!node->is_bitfield && node->left && !type_is_array(node->type)) {
@@ -6166,6 +6619,31 @@ ir_expr(IRProgram *ir, Node *node)
 
 			if (src && src->kind == ND_COMMA)
 				src = src->right;
+			if (src && src->kind == ND_CALL &&
+			    STRCMP(src->name, "__builtin_va_arg") == 0 && src->type &&
+			    (node->left->kind == ND_VAR || node->left->kind == ND_GLOBAL) &&
+			    type_sizeof(src->type) >= 8 && type_sizeof(src->type) <= 16) {
+				IRInst *load;
+				IRInst *store;
+				/* The parser preserves _Complex float as an 8-byte aggregate in
+				 * varargs even when its direct-call classification is unavailable. */
+				int is_complex_float = type_sizeof(src->type) == 8;
+				if (!src->args)
+					ICE("complex __builtin_va_arg expects a va_list argument");
+				ir_expr(ir, src->args);
+				load = ir_emit_raw(ir, IR_UNOP, "va_arg", NULL,
+				                   type_sizeof(src->type), 1);
+				load->extra = is_complex_float ? 1 : 2;
+				store = ir_emit_raw(ir, IR_UNOP,
+				                    node->left->kind == ND_VAR ?
+				                    "x64_store_ret_fp_agg_local" :
+				                    "x64_store_ret_fp_agg_global",
+				                    node->left->kind == ND_GLOBAL ? node->left->name : NULL,
+				                    node->left->kind == ND_VAR ? node->left->offset : 0,
+				                    is_complex_float ? 8 : type_sizeof(src->type) / 2);
+				store->fixed_params = is_complex_float ? 1 : 2;
+				return;
+			}
 			if (src && src->kind == ND_CALL &&
 			    src->type &&
 			    ir_type_uses_x64_complex_double_abi(src->type) &&
@@ -16277,6 +16755,14 @@ ir_emit_unop(Codegen *cg, const char *op, int value, int aux)
 		if (!cg->emit_va_start)
 			ICE("Backend missing va_start hook");
 		cg->emit_va_start();
+	} else if (STRCMP(op, "va_arg") == 0) {
+		if (!cg->emit_va_arg)
+			ICE("Backend missing va_arg hook");
+		cg->emit_va_arg(value ? (int)value : TCC_SIZEOF_INT, aux != 0, 0);
+	} else if (STRCMP(op, "va_copy") == 0) {
+		if (!cg->emit_va_copy)
+			ICE("Backend missing va_copy hook");
+		cg->emit_va_copy((int)value);
 	} else if (STRCMP(op, "load_via_saved") == 0) {
 		cg->emit_load_via_saved(value);
 	} else if (STRCMP(op, "bitnot") == 0) {
@@ -29725,6 +30211,81 @@ ir_try_emit_arm64_simple_memcpy8(Codegen *cg, IRInst *inst)
 }
 
 static int
+ir_emit_arm64_variadic_sized_call(Codegen *cg, IRInst *inst, int use_saved_call)
+{
+	int count;
+	int fixed;
+	int fp_reg = 0;
+	int int_reg = 0;
+	int i;
+	int dst_off = 0;
+	unsigned int stack_pair_mask;
+
+	if (!cg || cg != &arm64_codegen || !inst)
+		return 0;
+	if ((inst->kind != IR_CALL && inst->kind != IR_CALL_INDIRECT) ||
+	    inst->fixed_params < 0 || inst->extra == 0)
+		return 0;
+
+	count = (int)inst->value;
+	fixed = inst->fixed_params;
+	if (count <= 0)
+		return 0;
+	if (fixed > count)
+		fixed = count;
+	stack_pair_mask = (unsigned int)inst->extra;
+
+	for (i = 0; i < fixed; i++) {
+		if (inst->fp_arg_mask & (1u << i)) {
+			int size = (inst->fp_arg_double_mask & (1u << i)) ? 8 : 4;
+
+			if (fp_reg >= 8)
+				ICE("arm64 fixed floating call register overflow");
+			printf("    ldr %c%d, [sp, #%d]\n",
+			       size == 4 ? 's' : 'd', fp_reg, i * 16);
+			fp_reg++;
+		} else {
+			if (int_reg >= 8)
+				ICE("arm64 fixed integer call register overflow");
+			printf("    ldr x%d, [sp, #%d]\n", int_reg, i * 16);
+			int_reg++;
+		}
+	}
+
+	for (i = fixed; i < count; i++) {
+		int src_off = i * 16;
+
+		if (stack_pair_mask & (1u << i)) {
+			printf("    ldr x9, [sp, #%d]\n", src_off);
+			printf("    str x9, [sp, #%d]\n", dst_off);
+			printf("    ldr x10, [sp, #%d]\n", src_off + 8);
+			printf("    str x10, [sp, #%d]\n", dst_off + 8);
+			dst_off += 16;
+		} else if (inst->fp_arg_mask & (1u << i)) {
+			if (inst->fp_arg_double_mask & (1u << i)) {
+				printf("    ldr d16, [sp, #%d]\n", src_off);
+			} else {
+				printf("    ldr s16, [sp, #%d]\n", src_off);
+				printf("    fcvt d16, s16\n");
+			}
+			printf("    str d16, [sp, #%d]\n", dst_off);
+			dst_off += 8;
+		} else {
+			printf("    ldr x9, [sp, #%d]\n", src_off);
+			printf("    str x9, [sp, #%d]\n", dst_off);
+			dst_off += 8;
+		}
+	}
+
+	if (use_saved_call)
+		cg->emit_call_saved();
+	else
+		cg->emit_call(inst->name);
+	printf("    add sp, sp, #%d\n", count * 16);
+	return 1;
+}
+
+static int
 ir_emit_arm64_simple_direct_gpr_call_spilled(Codegen *cg, IRInst *inst,
                                              int fixed, int variadic_count)
 {
@@ -30949,6 +31510,45 @@ ir_emit_arm64_load_arg_hfa(Codegen *cg, IRInst *inst)
 }
 
 static void
+ir_emit_arm64_push_scalar(Codegen *cg, IRInst *inst)
+{
+	if (!cg || !inst || cg != &arm64_codegen || !cg->emit_stack_alloc)
+		return;
+
+	cg->emit_stack_alloc(16);
+	if (inst->subop == IR_OP_ARM64_PUSH_SCALAR_LOCAL) {
+		cg->emit_addr_local((int)inst->value);
+	} else if (inst->subop == IR_OP_ARM64_PUSH_SCALAR_GLOBAL) {
+		cg->emit_load_func_addr(inst->name);
+	} else {
+		ICE("unexpected arm64 scalar push subop");
+	}
+	printf("    ldr x9, [x0, #0]\n");
+	printf("    str x9, [sp, #0]\n");
+}
+
+static void
+ir_emit_arm64_push_pair(Codegen *cg, IRInst *inst)
+{
+	if (!cg || !inst || cg != &arm64_codegen || !cg->emit_stack_alloc)
+		return;
+
+	cg->emit_stack_alloc(16);
+	if (inst->subop == IR_OP_ARM64_PUSH_PAIR_LOCAL) {
+		cg->emit_addr_local((int)inst->value);
+	} else if (inst->subop == IR_OP_ARM64_PUSH_PAIR_GLOBAL) {
+		cg->emit_load_func_addr(inst->name);
+	} else {
+		ICE("unexpected arm64 pair push subop");
+	}
+	printf("    mov x17, x0\n");
+	printf("    ldr x9, [x17, #0]\n");
+	printf("    str x9, [sp, #0]\n");
+	printf("    ldr x10, [x17, #8]\n");
+	printf("    str x10, [sp, #8]\n");
+}
+
+static void
 ir_emit_x64_load_fp_aggregate(Codegen *cg, IRInst *inst, int first_xmm)
 {
 	int elem_size;
@@ -30961,6 +31561,21 @@ ir_emit_x64_load_fp_aggregate(Codegen *cg, IRInst *inst, int first_xmm)
 
 	elem_size = inst->aux ? inst->aux : 8;
 	elem_count = inst->fixed_params > 0 ? inst->fixed_params : 2;
+	if (elem_count == 1 && elem_size == 8) {
+		xmm_base = first_xmm + inst->extra;
+		if (xmm_base < 0 || xmm_base >= 8)
+			ICE("invalid x64 packed complex float xmm register");
+		if (inst->subop == IR_OP_X64_RET_FP_AGG_LOCAL ||
+		    inst->subop == IR_OP_X64_ARG_FP_AGG_LOCAL)
+			cg->emit_addr_local((int)inst->value);
+		else if (inst->subop == IR_OP_X64_RET_FP_AGG_GLOBAL ||
+		         inst->subop == IR_OP_X64_ARG_FP_AGG_GLOBAL)
+			cg->emit_load_func_addr(inst->name);
+		else
+			ICE("unexpected x64 packed complex float aggregate load");
+		printf("    movq xmm%d, QWORD PTR [rax]\n", xmm_base);
+		return;
+	}
 	if (elem_size != 8 || elem_count != 2)
 		ICE("unexpected x64 fp aggregate shape");
 	xmm_base = first_xmm + inst->extra;
@@ -30982,6 +31597,29 @@ ir_emit_x64_load_fp_aggregate(Codegen *cg, IRInst *inst, int first_xmm)
 }
 
 static void
+ir_emit_x64_store_fp_aggregate_stack(Codegen *cg, IRInst *inst)
+{
+	int elem_count;
+	int i;
+
+	if (!cg || !inst || cg != &x64_codegen)
+		return;
+	elem_count = inst->fixed_params > 0 ? inst->fixed_params : 2;
+	if (elem_count < 1 || elem_count > 2)
+		ICE("unexpected x64 outgoing fp aggregate shape");
+	if (inst->subop == IR_OP_X64_ARG_FP_AGG_STACK_LOCAL)
+		cg->emit_addr_local((int)inst->value);
+	else if (inst->subop == IR_OP_X64_ARG_FP_AGG_STACK_GLOBAL)
+		cg->emit_load_func_addr(inst->name);
+	else
+		ICE("unexpected x64 outgoing fp aggregate source");
+	for (i = 0; i < elem_count; i++) {
+		printf("    mov r10, QWORD PTR [rax+%d]\n", i * 8);
+		printf("    mov QWORD PTR [rsp+%d], r10\n", inst->extra + i * 8);
+	}
+}
+
+static void
 ir_emit_x64_store_ret_fp_aggregate(Codegen *cg, IRInst *inst)
 {
 	int elem_size;
@@ -30993,7 +31631,17 @@ ir_emit_x64_store_ret_fp_aggregate(Codegen *cg, IRInst *inst)
 
 	elem_size = inst->aux ? inst->aux : 8;
 	elem_count = inst->fixed_params > 0 ? inst->fixed_params : 2;
-	if (elem_size != 8 || elem_count != 2)
+	if (elem_count == 1 && elem_size == 8) {
+		if (inst->subop == IR_OP_X64_STORE_RET_FP_AGG_LOCAL)
+			cg->emit_addr_local((int)inst->value);
+		else if (inst->subop == IR_OP_X64_STORE_RET_FP_AGG_GLOBAL)
+			cg->emit_load_func_addr(inst->name);
+		else
+			ICE("unexpected x64 fp aggregate store subop");
+		printf("    movq QWORD PTR [rax], xmm0\n");
+		return;
+	}
+	if ((elem_size != 4 && elem_size != 8) || elem_count != 2)
 		ICE("unexpected x64 fp aggregate store shape");
 
 	if (inst->subop == IR_OP_X64_STORE_RET_FP_AGG_LOCAL) {
@@ -31005,7 +31653,9 @@ ir_emit_x64_store_ret_fp_aggregate(Codegen *cg, IRInst *inst)
 	}
 
 	for (i = 0; i < elem_count; i++)
-		printf("    movsd QWORD PTR [rax+%d], xmm%d\n", i * elem_size, i);
+		printf("    mov%s %s PTR [rax+%d], xmm%d\n",
+		       elem_size == 4 ? "ss" : "sd",
+		       elem_size == 4 ? "DWORD" : "QWORD", i * elem_size, i);
 }
 
 static int
@@ -37441,7 +38091,10 @@ ir_inst_note_local_slot_offsets(const IRInst *inst, int *min_offset, int *saw_lo
 	    (inst->subop == IR_OP_LOAD_INDEXED ||
 	     inst->subop == IR_OP_ARM64_RET_HFA_LOCAL ||
 	     inst->subop == IR_OP_ARM64_STORE_RET_HFA_LOCAL ||
-	     inst->subop == IR_OP_ARM64_ARG_HFA_LOCAL))
+	     inst->subop == IR_OP_ARM64_ARG_HFA_LOCAL ||
+	     inst->subop == IR_OP_ARM64_ARG_GPR_LOCAL ||
+	     inst->subop == IR_OP_ARM64_ARG_AGG_LOCAL ||
+	     inst->subop == IR_OP_ARM64_ARG_AGG_STACK_LOCAL))
 		ir_note_local_slot_offset((int)inst->value, min_offset, saw_local);
 
 	if (inst->kind == IR_CALL && inst->simple_call_arg_count > 0) {
@@ -37710,7 +38363,7 @@ ir_function_effective_stack_size(IRInst *func_inst, int debug_unit_active)
 	if (debug_unit_active)
 		return (int)func_inst->value;
 	effective_size = ir_function_effective_local_stack_size(func_inst);
-	if (effective_size > (int)func_inst->value)
+	if (effective_size < (int)func_inst->value)
 		effective_size = (int)func_inst->value;
 	if (effective_size == func_inst->aux * 8 &&
 	    !ir_function_has_any_local_ref(func_inst))
@@ -39528,7 +40181,13 @@ ir_emit_stream(IRProgram *program, Codegen *cg, int emit_debug_info,
 					else
 						source_reg = int_param_reg++;
 
-					if (!debug_unit_active && !slot_is_used)
+					/* Direct x64 complex parameters arrive in FP registers, but their
+					 * return lowering may reference the declared local slot through a
+					 * dedicated aggregate instruction.  That reference is deliberately
+					 * opaque to the ordinary local-use scan, so do not elide its save. */
+					if (!debug_unit_active && !slot_is_used &&
+					    !is_x64_complex_fp_param &&
+					    !is_x64_complex_fp_pair_param)
 						continue;
 					if (cg == &arm64_codegen &&
 					    !slot_is_used &&
@@ -41413,6 +42072,21 @@ ir_emit_stream(IRProgram *program, Codegen *cg, int emit_debug_info,
 			if (inst->subop == IR_OP_GIDX_LOAD) {
 				cg->emit_pop_to_acc();
 				cg->emit_load_global_indexed(inst->name, inst->value ? inst->value : 4);
+			} else if (inst->subop == IR_OP_VA_ARG && inst->extra > 0) {
+				IRInst *store = inst->next;
+				if (cg != &x64_codegen || !cg->emit_va_arg || !store ||
+				    (store->subop != IR_OP_X64_STORE_RET_FP_AGG_LOCAL &&
+				     store->subop != IR_OP_X64_STORE_RET_FP_AGG_GLOBAL))
+					ICE("complex va_arg requires an x64 aggregate destination");
+				if (inst->extra == 1) {
+					/* _Complex float is one packed eight-byte SSE argument. */
+					store->aux = 8;
+					store->fixed_params = 1;
+				}
+				cg->emit_va_arg((int)inst->value, inst->aux != 0, inst->extra);
+				ir_emit_x64_store_ret_fp_aggregate(cg, store);
+				inst = store;
+				break;
 			} else if (inst->subop == IR_OP_ARM64_RET_AGG_LOCAL ||
 			           inst->subop == IR_OP_ARM64_RET_AGG_GLOBAL) {
 				if (cg != &arm64_codegen)
@@ -41431,6 +42105,97 @@ ir_emit_stream(IRProgram *program, Codegen *cg, int emit_debug_info,
 					ICE("HFA arg preload unop only valid on arm64");
 				ir_emit_arm64_load_arg_hfa(cg, inst);
 				break;
+			} else if (inst->subop == IR_OP_ARM64_ARG_HFA_STACK_LOCAL ||
+			           inst->subop == IR_OP_ARM64_ARG_HFA_STACK_GLOBAL) {
+				int size = inst->aux ? inst->aux : 8;
+				int count = inst->fixed_params > 0 ? inst->fixed_params : 1;
+				if (cg != &arm64_codegen || (size != 4 && size != 8))
+					ICE("invalid arm64 HFA stack argument");
+				if (inst->subop == IR_OP_ARM64_ARG_HFA_STACK_LOCAL)
+					cg->emit_addr_local((int)inst->value);
+				else
+					cg->emit_load_func_addr(inst->name);
+				printf("    mov x17, x0\n");
+				for (int j = 0; j < count; j++) {
+					printf("    ldr %c16, [x17, #%d]\n", size == 4 ? 's' : 'd', j * size);
+					printf("    str %c16, [sp, #%d]\n", size == 4 ? 's' : 'd',
+					       inst->extra + j * size);
+				}
+				break;
+			} else if (inst->subop == IR_OP_ARM64_ARG_GPR_LOCAL) {
+				if (cg != &arm64_codegen || !cg->emit_load_local_to_arg ||
+				    inst->extra < 0 || inst->extra >= 8)
+					ICE("invalid arm64 GPR argument preload");
+				cg->emit_load_local_to_arg(inst->extra, inst->value, inst->aux ? inst->aux : 8);
+				break;
+			} else if (inst->subop == IR_OP_ARM64_ARG_AGG_LOCAL ||
+			           inst->subop == IR_OP_ARM64_ARG_AGG_GLOBAL) {
+				int regs = inst->fixed_params > 0 ? inst->fixed_params : 1;
+				if (cg != &arm64_codegen || inst->extra < 0 || inst->extra + regs > 8)
+					ICE("invalid arm64 aggregate argument preload");
+				/* Address formation uses x0.  Save already-populated argument
+				 * registers in call-clobbered temporaries before forming it. */
+				for (int j = 0; j < inst->extra; j++)
+					printf("    mov x%d, x%d\n", 10 + j, j);
+				if (inst->subop == IR_OP_ARM64_ARG_AGG_LOCAL)
+					cg->emit_addr_local((int)inst->value);
+				else
+					cg->emit_load_func_addr(inst->name);
+				/* The address helpers use x0, which may itself already hold an
+				 * earlier scalar argument.  Preserve the source address in x9
+				 * before populating the aggregate's assigned argument registers. */
+				printf("    mov x9, x0\n");
+				for (int j = 0; j < inst->extra; j++)
+					printf("    mov x%d, x%d\n", j, 10 + j);
+				for (int j = 0; j < regs; j++) {
+					int remaining = inst->aux - j * 8;
+					if (remaining > 0 && remaining <= 4)
+						printf("    ldr w%d, [x9, #%d]\n", inst->extra + j, j * 8);
+					else
+						printf("    ldr x%d, [x9, #%d]\n", inst->extra + j, j * 8);
+				}
+				break;
+			} else if (inst->subop == IR_OP_ARM64_CALL_STACK_ALLOC) {
+				if (cg != &arm64_codegen || inst->value <= 0 || (inst->value & 15) != 0)
+					ICE("invalid arm64 outgoing call stack allocation");
+				printf("    sub sp, sp, #%ld\n", inst->value);
+				break;
+			} else if (inst->subop == IR_OP_ARM64_ARG_AGG_STACK_LOCAL ||
+			           inst->subop == IR_OP_ARM64_ARG_AGG_STACK_GLOBAL) {
+				int words = (inst->aux + 7) / 8;
+				if (cg != &arm64_codegen || words <= 0)
+					ICE("invalid arm64 aggregate stack argument");
+				/* Address formation uses x0; preserve all populated integer
+				 * argument registers while locating the aggregate source. */
+				for (int j = 0; j < 8; j++)
+					printf("    mov x%d, x%d\n", 10 + j, j);
+				if (inst->subop == IR_OP_ARM64_ARG_AGG_STACK_LOCAL)
+					cg->emit_addr_local((int)inst->value);
+				else
+					cg->emit_load_func_addr(inst->name);
+				printf("    mov x9, x0\n");
+				for (int j = 0; j < 8; j++)
+					printf("    mov x%d, x%d\n", j, 10 + j);
+				for (int j = 0; j < words; j++) {
+					int remaining = inst->aux - j * 8;
+					if (remaining > 0 && remaining <= 4)
+						printf("    ldr w10, [x9, #%d]\n    str w10, [sp, #%d]\n", j * 8, inst->extra + j * 8);
+					else
+						printf("    ldr x10, [x9, #%d]\n    str x10, [sp, #%d]\n", j * 8, inst->extra + j * 8);
+				}
+				break;
+			} else if (inst->subop == IR_OP_ARM64_PUSH_SCALAR_LOCAL ||
+			           inst->subop == IR_OP_ARM64_PUSH_SCALAR_GLOBAL) {
+				if (cg != &arm64_codegen)
+					ICE("arm64 scalar push unop only valid on arm64");
+				ir_emit_arm64_push_scalar(cg, inst);
+				break;
+			} else if (inst->subop == IR_OP_ARM64_PUSH_PAIR_LOCAL ||
+			           inst->subop == IR_OP_ARM64_PUSH_PAIR_GLOBAL) {
+				if (cg != &arm64_codegen)
+					ICE("arm64 pair push unop only valid on arm64");
+				ir_emit_arm64_push_pair(cg, inst);
+				break;
 			} else if (inst->subop == IR_OP_X64_RET_FP_AGG_LOCAL ||
 			           inst->subop == IR_OP_X64_RET_FP_AGG_GLOBAL) {
 				if (cg != &x64_codegen)
@@ -41442,6 +42207,40 @@ ir_emit_stream(IRProgram *program, Codegen *cg, int emit_debug_info,
 				if (cg != &x64_codegen)
 					ICE("x64 fp aggregate arg preload only valid on x64");
 				ir_emit_x64_load_fp_aggregate(cg, inst, 0);
+				break;
+			} else if (inst->subop == IR_OP_X64_CALL_STACK_ALLOC) {
+				if (cg != &x64_codegen || inst->value <= 0 || (inst->value & 15) != 0)
+					ICE("invalid x64 outgoing call stack allocation");
+				printf("    sub rsp, %ld\n", inst->value);
+				break;
+			} else if (inst->subop == IR_OP_X64_ARG_FP_AGG_STACK_LOCAL ||
+			           inst->subop == IR_OP_X64_ARG_FP_AGG_STACK_GLOBAL) {
+				if (cg != &x64_codegen)
+					ICE("x64 aggregate stack argument only valid on x64");
+				ir_emit_x64_store_fp_aggregate_stack(cg, inst);
+				break;
+			} else if (inst->subop == IR_OP_X64_ARG_FP_SCALAR_LOCAL) {
+				int xmm = inst->extra;
+				int size = inst->aux ? inst->aux : 8;
+				if (cg != &x64_codegen || xmm < 0 || xmm >= 8 ||
+				    (size != 4 && size != 8))
+					ICE("invalid x64 scalar FP argument preload");
+				cg->emit_load_local_sized((int)inst->value, size);
+				printf("    mov%s xmm%d, rax\n", size == 4 ? "d" : "q", xmm);
+				break;
+			} else if (inst->subop == IR_OP_X64_ARG_FP_SCALAR_STACK_LOCAL) {
+				int size = inst->aux ? inst->aux : 8;
+				if (cg != &x64_codegen || (size != 4 && size != 8))
+					ICE("invalid x64 scalar FP stack argument");
+				cg->emit_load_local_sized((int)inst->value, size);
+				printf("    mov QWORD PTR [rsp+%d], rax\n", inst->extra);
+				break;
+			} else if (inst->subop == IR_OP_X64_ARG_GPR_LOCAL) {
+				static const char *const regs[] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+				if (cg != &x64_codegen || inst->extra < 0 || inst->extra >= 6)
+					ICE("invalid x64 GPR argument preload");
+				cg->emit_load_local_sized((int)inst->value, 8);
+				printf("    mov %s, rax\n", regs[inst->extra]);
 				break;
 			} else if (inst->subop == IR_OP_ARM64_STORE_RET_AGG_LOCAL ||
 			           inst->subop == IR_OP_ARM64_STORE_RET_AGG_GLOBAL) {
@@ -41766,7 +42565,27 @@ ir_emit_stream(IRProgram *program, Codegen *cg, int emit_debug_info,
 					skip_linear_until_label = 1;
 				break;
 			}
-			if (inst->fp_arg_mask) {
+			if (ir_emit_arm64_variadic_sized_call(cg, inst, 0)) {
+				ir_finish_emitted_call_result(cg, &inst, &in_function,
+				                              &current_func_name, &function_just_ended,
+				                              debug_unit_active, &current_debug_end_label,
+				                              &current_function_exit_label,
+				                              &skip_linear_until_label);
+				if (ir_call_name_is_noreturn(inst->name))
+					skip_linear_until_label = 1;
+				break;
+			}
+			if (cg == &x64_codegen && inst->x64_stack_arg_bytes > 0) {
+				/* Explicit aggregate stack arguments were laid out before this
+				 * instruction; do not let the generic expression-stack path move
+				 * or realign them. */
+				if (inst->value != 0)
+					ICE("x64 explicit stack layout with GPR arguments is not lowered");
+				if (inst->fixed_params >= 0 && inst->extra > 0)
+					printf("    mov eax, %d\n", inst->extra);
+				cg->emit_call(inst->name);
+				printf("    add rsp, %d\n", inst->x64_stack_arg_bytes);
+			} else if (inst->fp_arg_mask) {
 				if (!cg->emit_call_fp_args)
 					ICE("backend missing emit_call_fp_args");
 				cg->emit_call_fp_args(inst->name, (int)inst->value,
@@ -41775,8 +42594,15 @@ ir_emit_stream(IRProgram *program, Codegen *cg, int emit_debug_info,
 				                    inst->fp_arg_double_mask);
 			} else {
 				cg->emit_prepare_call_args(inst->value, inst->fixed_params);
+				/* The x64 mixed-complex call path has already placed aggregate
+				 * lanes in XMM registers.  SysV requires AL to report that count
+				 * to a variadic callee. */
+				if (cg == &x64_codegen && inst->fixed_params >= 0 && inst->extra > 0)
+					printf("    mov eax, %d\n", inst->extra);
 				cg->emit_call(inst->name);
 				cg->emit_cleanup_call_args(inst->value, inst->fixed_params);
+				if (cg == &arm64_codegen && inst->x64_stack_arg_bytes)
+					printf("    add sp, sp, #%d\n", inst->x64_stack_arg_bytes);
 			}
 			ir_finish_emitted_call_result(cg, &inst, &in_function,
 			                              &current_func_name, &function_just_ended,
@@ -41789,6 +42615,8 @@ ir_emit_stream(IRProgram *program, Codegen *cg, int emit_debug_info,
 
 		case IR_CALL_PACKED_GPR:
 			cg->emit_call(inst->name);
+			if (cg == &arm64_codegen && inst->x64_stack_arg_bytes)
+				printf("    add sp, sp, #%d\n", inst->x64_stack_arg_bytes);
 			ir_finish_emitted_call_result(cg, &inst, &in_function,
 			                              &current_func_name, &function_just_ended,
 			                              debug_unit_active, &current_debug_end_label,
@@ -41849,6 +42677,14 @@ ir_emit_stream(IRProgram *program, Codegen *cg, int emit_debug_info,
 			}
 			cg->emit_pop_to_acc();      /* callee */
 			cg->emit_acc_to_saved();
+			if (ir_emit_arm64_variadic_sized_call(cg, inst, 1)) {
+				ir_finish_emitted_call_result(cg, &inst, &in_function,
+				                              &current_func_name, &function_just_ended,
+				                              debug_unit_active, &current_debug_end_label,
+				                              &current_function_exit_label,
+				                              &skip_linear_until_label);
+				break;
+			}
 			if (inst->fp_arg_mask) {
 				if (!cg->emit_call_saved_fp_args)
 					ICE("backend missing emit_call_saved_fp_args");

@@ -2930,16 +2930,32 @@ parse_factor(void)
 
 	if (token->kind == TOK_IDENT) {
 		parser_profile_scope_enter(PARSER_PROF_EXPR_IDENT);
-		lexer_next();
-
 		char ident_name[64];
 		STRNCPY(ident_name, token->text, sizeof(ident_name) - 1);
+		/* lexer_next may recycle the current token storage. Preserve the
+		 * identifier before advancing so builtin dispatch is deterministic. */
+		lexer_next();
 
 		if (STRCMP(ident_name, "__func__") == 0 && tcc_lang_is_c89_or_c90())
 			fatal_cur("__func__ is not allowed in C89/C90 mode\n");
 
 		if (lexer_peek()->kind == TOK_LPAREN) {
 			ENTER_IDENT_BUCKET(PARSER_PROF_EXPR_IDENT_CALL);
+			if (STRCMP(ident_name, "__builtin_va_arg") == 0) {
+				Node *ap;
+				Node *call;
+				Type *result_type;
+				lexer_next(); /* consume ( */
+				ap = parse_assignment();
+				expect(TOK_COMMA);
+				result_type = parse_type_name();
+				expect(TOK_RPAREN);
+				call = new_call("__builtin_va_arg", ap);
+				call->type = result_type;
+				call->elem_size = type_sizeof(result_type);
+				call->is_unsigned = type_is_unsigned(result_type);
+				RETURN_IDENT_NODE(call);
+			}
 			/* offsetof(Type, field) builtin */
 			if (STRCMP(ident_name, "offsetof") == 0) {
 				char sname[64] = {0};
@@ -3014,6 +3030,19 @@ parse_factor(void)
 
 				fi = find_func(ident_name);
 				lexer_next();
+				if (STRCMP(ident_name, "__builtin_va_arg") == 0) {
+					Node *ap = parse_assignment();
+					Node *call;
+					Type *result_type;
+					expect(TOK_COMMA);
+					result_type = parse_type_name();
+					expect(TOK_RPAREN);
+					call = new_call("__builtin_va_arg", ap);
+					call->type = result_type;
+					call->elem_size = type_sizeof(result_type);
+					call->is_unsigned = type_is_unsigned(result_type);
+					RETURN_IDENT_NODE(call);
+				}
 
 				if (!fi) {
 					Global *global_info = parser_find_global_info(ident_name);
@@ -3054,19 +3083,28 @@ parse_factor(void)
 				if (!fi &&
 				    STRCMP(ident_name, "__builtin_stack_save") != 0 &&
 				    STRCMP(ident_name, "__builtin_stack_restore") != 0 &&
-				    STRCMP(ident_name, "__builtin_stack_alloc") != 0 &&
-				    STRCMP(ident_name, "__builtin_va_start") != 0 &&
-				    tcc_lang_at_least(LANG_C99)) {
+			    STRCMP(ident_name, "__builtin_stack_alloc") != 0 &&
+			    STRCMP(ident_name, "__builtin_va_start") != 0 &&
+			    STRCMP(ident_name, "__builtin_va_arg") != 0 &&
+			    STRCMP(ident_name, "__builtin_va_copy") != 0 &&
+			    tcc_lang_at_least(LANG_C99)) {
 					fatal_cur("implicit function declaration of '%s' is not allowed in C99 or later\n", ident_name);
 				}
 
 			Node *call = new_call(ident_name, args);
 			if (STRCMP(ident_name, "__builtin_stack_save") == 0 ||
 			    STRCMP(ident_name, "__builtin_stack_alloc") == 0 ||
-			    STRCMP(ident_name, "__builtin_va_start") == 0) {
+			    STRCMP(ident_name, "__builtin_va_start") == 0 ||
+			    STRCMP(ident_name, "__builtin_va_copy") == 0) {
 				call->is_pointer = 1;
 				call->elem_size = 1;
-				call->type = type_ptr(type_char());
+				/* va_start returns the same opaque cursor-pointer type as its
+				 * destination. This preserves type checking for the x64 va_list
+				 * macro while the backend supplies the cursor address. */
+				call->type = STRCMP(ident_name, "__builtin_va_start") == 0 && args && args->type
+					? clone_type(args->type) :
+					(STRCMP(ident_name, "__builtin_va_copy") == 0 && args && args->next && args->next->type
+						? clone_type(args->next->type) : type_ptr(type_char()));
 				RETURN_IDENT_NODE(call);
 			}
 			if (fi && fi->return_type)
